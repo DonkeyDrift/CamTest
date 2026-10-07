@@ -58,7 +58,10 @@ typedef struct {
     int cam_fd, jpeg_fd;
     esp_cam_sensor_device_t *sensor;
     esp_cam_sensor_format_array_t fmt_array;   /* sensor 支持的全部格式（指向驱动静态表） */
-    const esp_cam_sensor_format_t *cur_fmt;    /* 当前 sensor 格式 */
+    const esp_cam_sensor_format_t *cur_fmt;    /* 当前 sensor 格式（采集用原生档） */
+    int src_w, src_h;                          /* 原生采集分辨率 */
+    int tgt_w, tgt_h;                          /* 目标输出分辨率（虚拟档可小于原生） */
+    struct { int kx, ky, x0, y0; } dsc;        /* 原生→目标映射：整数抽取(kx,ky) + 中心裁剪起点(x0,y0) */
 
     /* DVP 采集缓冲（mmap） */
     struct {
@@ -115,27 +118,76 @@ static osd_fmt_t fmt_to_osd(uint32_t v4l2_fourcc)
     return OSD_FMT_RGB565;
 }
 
-/* ---------- 拷贝进编码器输入槽：YUYV→UYVY 换序 / RGB565_BE→LE 交换，其余直拷 ---------- */
-static void fill_encoder_input(uint8_t *dst, const uint8_t *src, size_t bytes, uint32_t fourcc, uint64_t now_us)
+/*
+ * 原生帧 → 编码器输入：整数抽取(kx,ky，保全视场) 或 中心裁剪(x0,y0)，同时完成
+ * YUYV→UYVY / RGB565_BE→LE 的字节序转换（推导见文件头与 API_NOTES.md）。
+ * YUV422 按宏像素（2 像素 4 字节，色度共用）处理，要求目标宽为偶数。
+ */
+static void fill_encoder_input(uint8_t *dst, const uint8_t *src, uint32_t fourcc, uint64_t now_us)
 {
-    if (fourcc == V4L2_PIX_FMT_YUYV) {
-        /* YUYV = Y0 U0 Y1 V0 → 逐 16-bit 字节交换 = UYVY = U0 Y0 V0 Y1（推导见文件头/API_NOTES） */
-        const uint16_t *s = (const uint16_t *)src;
-        uint16_t *d = (uint16_t *)dst;
-        for (size_t i = 0; i < bytes / 2; i++) d[i] = __builtin_bswap16(s[i]);
-    } else if (fourcc == V4L2_PIX_FMT_RGB565X) {
-        /* 传感器 BE → 编码器要 LE RGB565 */
-        const uint16_t *s = (const uint16_t *)src;
-        uint16_t *d = (uint16_t *)dst;
-        for (size_t i = 0; i < bytes / 2; i++) d[i] = __builtin_bswap16(s[i]);
-    } else {
-        memcpy(dst, src, bytes);
+    const int sw = s_p.src_w, sh = s_p.src_h;
+    const int tw = s_p.info.w, th = s_p.info.h;
+    const int kx = s_p.dsc.kx, ky = s_p.dsc.ky, x0 = s_p.dsc.x0, y0 = s_p.dsc.y0;
+    const size_t srow = (size_t)sw * 2, drow = (size_t)tw * 2;   /* 两种格式均 2B/px */
+
+    const bool passthrough = (tw == sw && th == sh && kx == 1 && ky == 1 && x0 == 0 && y0 == 0);
+    if (fourcc == V4L2_PIX_FMT_YUYV || fourcc == V4L2_PIX_FMT_UYVY) {
+        const bool swap = (fourcc == V4L2_PIX_FMT_YUYV);   /* YUYV→UYVY 逐 16bit 交换 */
+        if (passthrough && !swap) {
+            memcpy(dst, src, drow * sh);
+        } else if (passthrough) {
+            const uint16_t *sp = (const uint16_t *)src;
+            uint16_t *dp = (uint16_t *)dst;
+            for (size_t i = 0; i < drow * sh / 2; i++) dp[i] = __builtin_bswap16(sp[i]);
+        } else {
+            for (int ty = 0; ty < th; ty++) {
+                const uint8_t *sr = src + (size_t)(y0 + ty * ky) * srow;
+                uint8_t *dr = dst + (size_t)ty * drow;
+                for (int tx = 0; tx < tw; tx += 2) {
+                    const uint8_t *sp = sr + ((size_t)(x0 / 2) + (size_t)(tx / 2) * kx) * 4;
+                    uint8_t *dp = dr + (size_t)tx * 2;
+                    if (swap) { dp[0]=sp[1]; dp[1]=sp[0]; dp[2]=sp[3]; dp[3]=sp[2]; }
+                    else      { dp[0]=sp[0]; dp[1]=sp[1]; dp[2]=sp[2]; dp[3]=sp[3]; }
+                }
+            }
+        }
+    } else {   /* RGB565：BE(X) 需交换，LE 直拷 */
+        const bool swap = (fourcc == V4L2_PIX_FMT_RGB565X);
+        for (int ty = 0; ty < th; ty++) {
+            const uint16_t *sr = (const uint16_t *)(src + (size_t)(y0 + ty * ky) * srow) + x0;
+            uint16_t *dr = (uint16_t *)(dst + (size_t)ty * drow);
+            for (int tx = 0; tx < tw; tx++) {
+                uint16_t v = sr[(size_t)tx * kx];
+                dr[tx] = swap ? __builtin_bswap16(v) : v;
+            }
+        }
     }
     if (s_p.overlay) {
-        yuv_osd_draw_ms_counter(dst, bytes / (s_p.info.h), s_p.info.w, s_p.info.h,
-                                fmt_to_osd(fourcc == V4L2_PIX_FMT_YUYV ? V4L2_PIX_FMT_UYVY : fourcc),
-                                now_us);
+        uint32_t out_fourcc = (fourcc == V4L2_PIX_FMT_YUYV) ? V4L2_PIX_FMT_UYVY : fourcc;
+        yuv_osd_draw_ms_counter(dst, drow, tw, th, fmt_to_osd(out_fourcc), now_us);
     }
+}
+
+/*
+ * 规划 原生(sw,sh)→目标(tw,th) 的映射：
+ *   1) 相等：恒等；
+ *   2) 双轴整除：整数抽取（保全视场，优先）；
+ *   3) 目标不超过源：中心裁剪（视野变小）；
+ *   4) 需要放大：不支持。
+ * YUV422 宏像素要求目标宽为偶数。
+ */
+static bool plan_virtual(int sw, int sh, int tw, int th, int *kx, int *ky, int *x0, int *y0)
+{
+    if ((tw & 1) || tw < 16 || th < 16) return false;
+    if (tw == sw && th == sh) { *kx=*ky=1; *x0=*y0=0; return true; }
+    if (sw % tw == 0 && sh % th == 0) { *kx=sw/tw; *ky=sh/th; *x0=*y0=0; return true; }
+    if (tw <= sw && th <= sh) { *kx=*ky=1; *x0=(sw-tw)/2 & ~1; *y0=(sh-th)/2; return true; }
+    return false;
+}
+
+static bool is_yuv(esp_cam_sensor_output_format_t f)
+{
+    return f == ESP_CAM_SENSOR_PIXFORMAT_YUV422_UYVY || f == ESP_CAM_SENSOR_PIXFORMAT_YUV422_YUYV;
 }
 
 /* ---------- 设备打开/格式设置/缓冲管理 ---------- */
@@ -161,9 +213,9 @@ static void teardown_pipeline_locked(void)
         close(s_p.jpeg_fd);
         s_p.jpeg_fd = -1;
     }
-    if (s_p.free_in) { vQueueDelete(s_p.free_in); s_p.free_in = NULL; }
-    if (s_p.enc_trigger) { vSemaphoreDelete(s_p.enc_trigger); s_p.enc_trigger = NULL; }
-    /* 注意：帧环不销毁——流客户端任务可能仍持有其指针；init 时按最大分辨率一次分配 */
+    /* 队列/信号量/帧环均不销毁（任务或客户端可能仍阻塞/持有其中）——init 一次创建，
+     * 重建时只做复位（见 build_pipeline_locked）。DQBUF 已设 200ms 超时，
+     * 停靠握手能在超时窗口内达成，不会悬挂 apply。 */
     s_p.running = false;
 }
 
@@ -215,8 +267,8 @@ static esp_err_t setup_jpeg_device(uint32_t fourcc_in)
     struct v4l2_requestbuffers rc = { .count = JPEG_OUT_BUFS, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
     ESP_RETURN_ON_ERROR(xioctl(s_p.jpeg_fd, VIDIOC_REQBUFS, &rc) ? ESP_FAIL : ESP_OK, TAG, "jpeg REQBUFS CAP");
 
-    s_p.free_in = xQueueCreate(JPEG_IN_BUFS, sizeof(int));
-    s_p.enc_trigger = xSemaphoreCreateCounting(JPEG_IN_BUFS, 0);
+    xQueueReset(s_p.free_in);
+    while (xSemaphoreTake(s_p.enc_trigger, 0) == pdTRUE) {}   /* 清残留触发 */
     for (int i = 0; i < JPEG_IN_BUFS; i++) {
         struct v4l2_buffer buf = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_MMAP, .index = i };
         ESP_RETURN_ON_ERROR(xioctl(s_p.jpeg_fd, VIDIOC_QUERYBUF, &buf) ? ESP_FAIL : ESP_OK, TAG, "jpeg QUERYBUF OUT");
@@ -243,15 +295,27 @@ static esp_err_t setup_jpeg_device(uint32_t fourcc_in)
 static esp_err_t build_pipeline_locked(void)
 {
     const esp_cam_sensor_format_t *f = s_p.cur_fmt;
-    s_p.info.w = f->width; s_p.info.h = f->height;
+    s_p.src_w = f->width; s_p.src_h = f->height;          /* 原生采集分辨率 */
+    s_p.info.w = s_p.tgt_w; s_p.info.h = s_p.tgt_h;       /* 目标输出分辨率（虚拟档） */
     s_p.info.fps = f->fps; s_p.info.pclk_hz = f->xclk;   /* 格式表只有 xclk 输入时钟，无 PCLK 字段 */
-    strlcpy(s_p.info.fmt_name, f->name, sizeof(s_p.info.fmt_name));
+    if (s_p.tgt_w == f->width && s_p.tgt_h == f->height) {
+        strlcpy(s_p.info.fmt_name, f->name, sizeof(s_p.info.fmt_name));
+    } else {
+        snprintf(s_p.info.fmt_name, sizeof(s_p.info.fmt_name), "%s%s→%dx%d",
+                 f->name,
+                 (s_p.dsc.kx > 1 || s_p.dsc.ky > 1) ? " 抽取" : " 裁剪",
+                 s_p.tgt_w, s_p.tgt_h);
+    }
     uint32_t fourcc = sensor_fmt_to_v4l2(f->format);
     esp_cam_sensor_output_format_t of = f->format;
     memcpy(s_p.info.v4l2_fourcc, &fourcc, 4); s_p.info.v4l2_fourcc[4] = 0;
 
     s_p.cam_fd = open(CAM_DEV, O_RDWR);
     ESP_RETURN_ON_FALSE(s_p.cam_fd >= 0, ESP_FAIL, TAG, "open %s", CAM_DEV);
+    {
+        struct timeval tv = { .tv_sec = 0, .tv_usec = DQBUF_TIMEOUT_MS * 1000 };
+        xioctl(s_p.cam_fd, VIDIOC_S_DQBUF_TIMEOUT, &tv);   /* 停靠握手依赖此超时 */
+    }
 
     /* 1) 切 sensor 格式（分辨率切换的唯一途径，见 API_NOTES.md 第 4 节） */
     esp_cam_sensor_format_t fmt_copy = *f;
@@ -267,6 +331,10 @@ static esp_err_t build_pipeline_locked(void)
     /* 3) 打开编码器并配置 */
     s_p.jpeg_fd = open(JPEG_DEV, O_RDWR);
     ESP_RETURN_ON_FALSE(s_p.jpeg_fd >= 0, ESP_FAIL, TAG, "open %s (检查 CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE)", JPEG_DEV);
+    {
+        struct timeval tv = { .tv_sec = 0, .tv_usec = DQBUF_TIMEOUT_MS * 1000 };
+        xioctl(s_p.jpeg_fd, VIDIOC_S_DQBUF_TIMEOUT, &tv);
+    }
     ESP_RETURN_ON_ERROR(setup_jpeg_device(fourcc), TAG, "jpeg setup");
 
     /* 4) 帧环：init 时已按最大分辨率分配（apply 重建时绝不销毁，见 teardown 注释） */
@@ -307,13 +375,14 @@ static void capture_task(void *arg)
         s_p.stats.cap_frames++;
         int idx;
         if (xQueueReceive(s_p.free_in, &idx, 0) == pdTRUE) {
-            size_t bytes = buf.bytesused ? buf.bytesused : s_p.cam_buf[buf.index].length;
-            bytes = MIN(bytes, s_p.j_in[idx].length);
-            fill_encoder_input(s_p.j_in[idx].start, s_p.cam_buf[buf.index].start, bytes,
+            /* 编码器输入按目标分辨率填充（源帧可能更大，抽取/裁剪在 fill 内完成） */
+            size_t out_bytes = (size_t)s_p.info.w * s_p.info.h * 2;
+            out_bytes = MIN(out_bytes, s_p.j_in[idx].length);
+            fill_encoder_input(s_p.j_in[idx].start, s_p.cam_buf[buf.index].start,
                                sensor_fmt_to_v4l2(s_p.cur_fmt->format), t_cap);
             s_p.j_in_tcap[idx] = t_cap;
             struct v4l2_buffer vb = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_MMAP,
-                                      .index = idx, .bytesused = bytes };
+                                      .index = idx, .bytesused = out_bytes };
             if (xioctl(s_p.jpeg_fd, VIDIOC_QBUF, &vb) != 0) {
                 xQueueSend(s_p.free_in, &idx, 0);
                 s_p.stats.capture_drops++;
@@ -419,6 +488,9 @@ esp_err_t cam_pipe_init(void)
     }
     s_p.ring = frame_ring_create(3, max_cap);
     ESP_RETURN_ON_FALSE(s_p.ring, ESP_ERR_NO_MEM, TAG, "frame ring %ukB x3", (unsigned)(max_cap / 1024));
+    s_p.free_in = xQueueCreate(JPEG_IN_BUFS, sizeof(int));
+    s_p.enc_trigger = xSemaphoreCreateCounting(JPEG_IN_BUFS, 0);
+    ESP_RETURN_ON_FALSE(s_p.free_in && s_p.enc_trigger, ESP_ERR_NO_MEM, TAG, "sync primitives");
 
     /* 默认取当前 sensor 已配置格式（Kconfig DEFAULT_FMT）；找不到则用第一个可编码格式 */
     esp_cam_sensor_format_t cur;
@@ -440,6 +512,10 @@ esp_err_t cam_pipe_init(void)
         }
     }
     ESP_RETURN_ON_FALSE(s_p.cur_fmt, ESP_ERR_NOT_SUPPORTED, TAG, "no hw-encodable format");
+    s_p.tgt_w = s_p.cur_fmt->width;
+    s_p.tgt_h = s_p.cur_fmt->height;
+    s_p.dsc.kx = s_p.dsc.ky = 1;
+    s_p.dsc.x0 = s_p.dsc.y0 = 0;
     s_p.inited = true;
     return ESP_OK;
 }
@@ -469,24 +545,42 @@ esp_err_t cam_pipe_apply(int w, int h, uint8_t quality, int fps_limit)
     vTaskDelay(pdMS_TO_TICKS(30));   /* 双保险：等退出中的 ioctl 全部返回 */
 
     const esp_cam_sensor_format_t *want = NULL;
+    int vkx = 1, vky = 1, vx0 = 0, vy0 = 0;
     if (w && h) {
-        /* 同分辨率多格式时优先 YUV422（UYVY/YUYV），RGB565 次之（色彩子采样更符合预期） */
+        /* 1) 原生精确匹配：同分辨率多格式时优先 YUV422，RGB565 次之 */
         const esp_cam_sensor_format_t *fallback = NULL;
         for (uint32_t i = 0; i < s_p.fmt_array.count; i++) {
             const esp_cam_sensor_format_t *f = &s_p.fmt_array.format_array[i];
             if (f->width == w && f->height == h && fmt_hw_encodable(f->format)) {
-                if (f->format == ESP_CAM_SENSOR_PIXFORMAT_YUV422_UYVY ||
-                    f->format == ESP_CAM_SENSOR_PIXFORMAT_YUV422_YUYV) { want = f; break; }
+                if (is_yuv(f->format)) { want = f; break; }
                 if (!fallback) fallback = f;
             }
         }
         if (!want) want = fallback;
+        /* 2) 虚拟档：整数抽取优先（保全视场），其次中心裁剪；YUV 源优先 */
+        if (!want) {
+            const esp_cam_sensor_format_t *fb = NULL;
+            int fkx=1, fky=1, fx0=0, fy0=0;
+            for (uint32_t i = 0; i < s_p.fmt_array.count; i++) {
+                const esp_cam_sensor_format_t *f = &s_p.fmt_array.format_array[i];
+                if (!fmt_hw_encodable(f->format)) continue;
+                int kx, ky, x0, y0;
+                if (!plan_virtual(f->width, f->height, w, h, &kx, &ky, &x0, &y0)) continue;
+                if (is_yuv(f->format)) { want = f; vkx=kx; vky=ky; vx0=x0; vy0=y0; break; }
+                if (!fb) { fb = f; fkx=kx; fky=ky; fx0=x0; fy0=y0; }
+            }
+            if (!want && fb) {
+                want = fb; vkx=fkx; vky=fky; vx0=fx0; vy0=fy0;
+            }
+        }
         if (!want) { /* 恢复运行后报不支持 */
             xEventGroupSetBits(s_p.ev, EV_RUN);
             xSemaphoreGive(s_p.api_lock);
             return ESP_ERR_NOT_SUPPORTED;
         }
         s_p.cur_fmt = want;
+        s_p.tgt_w = w; s_p.tgt_h = h;
+        s_p.dsc.kx = vkx; s_p.dsc.ky = vky; s_p.dsc.x0 = vx0; s_p.dsc.y0 = vy0;
     }
     if (quality) s_p.quality = quality;
     s_p.fps_limit = fps_limit;
@@ -533,26 +627,42 @@ void cam_pipe_set_fps_limit(int fps)
 
 bool cam_pipe_res_supported(int w, int h)
 {
+    int kx, ky, x0, y0;
     for (uint32_t i = 0; i < s_p.fmt_array.count; i++) {
         const esp_cam_sensor_format_t *f = &s_p.fmt_array.format_array[i];
-        if (f->width == w && f->height == h && fmt_hw_encodable(f->format)) return true;
+        if (!fmt_hw_encodable(f->format)) continue;
+        if (f->width == w && f->height == h) return true;
+        if (plan_virtual(f->width, f->height, w, h, &kx, &ky, &x0, &y0)) return true;
     }
     return false;
 }
 
 int cam_pipe_supported_res(char *out, size_t outlen)
 {
+    static const int tiers[][2] = {
+        {160,120},{320,240},{480,320},{640,480},{800,600},{1280,720},
+    };
     int n = 0;
     out[0] = 0;
-    for (uint32_t i = 0; i < s_p.fmt_array.count; i++) {
+    /* 先列标准档位（小→大，含虚拟档），再补 sensor 独有原生档 */
+    for (size_t t = 0; t < sizeof(tiers) / sizeof(tiers[0]); t++) {
+        if (!cam_pipe_res_supported(tiers[t][0], tiers[t][1])) continue;
+        char item[16];
+        snprintf(item, sizeof(item), "%dx%d", tiers[t][0], tiers[t][1]);
+        if (strstr(out, item)) continue;
+        if (n) strlcat(out, ",", outlen);
+        strlcat(out, item, outlen);
+        n++;
+    }
+    for (uint32_t i = 0; i < s_p.fmt_array.count && n < 12; i++) {
         const esp_cam_sensor_format_t *f = &s_p.fmt_array.format_array[i];
         if (!fmt_hw_encodable(f->format)) continue;
         char item[16];
         snprintf(item, sizeof(item), "%ux%u", f->width, f->height);
         if (strstr(out, item)) continue;
+        if (n) strlcat(out, ",", outlen);
         strlcat(out, item, outlen);
         n++;
-        if (i + 1 < s_p.fmt_array.count && n < 12) strlcat(out, ",", outlen);
     }
     return n;
 }

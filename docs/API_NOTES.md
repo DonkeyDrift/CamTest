@@ -47,9 +47,9 @@
 | SC101IOT | UYVY/YUYV 1280x720 @15/25fps | 只有一档分辨率；UYVY 可直喂 JPEG |
 | OV3660 | YUYV 240x240@24 / YUYV 640x480@10 / RGB565 240x240@24 / RGB565 640x480@10 / JPEG 1280x720@12(sensor 内编码) | 无 160x120/320x240/800x600 档位 |
 
-⇒ 任务书里的 6 档分辨率矩阵在本组件版本下大部分为 unsupported（自动跳过并标记）；
-   160×120~320×240 低延迟档需要后续组件版本增加 sensor windowing 支持或 DVP 硬件缩放
-   （README「待核实清单」）。运行时以 `esp_cam_sensor_query_format()` 实际枚举为准。
+⇒ 任务书的分辨率矩阵通过「软件虚拟档」补齐：整数抽取（保 FOV）/中心裁剪（保帧率）在
+   采集→编码之间完成（见 camera_pipeline.c 的 plan_virtual/fill_encoder_input）。
+   运行时以 `esp_cam_sensor_query_format()` 实际枚举为准；800×600/1280×720（OV3660）仍 unsupported。
 
 - sensor 自动侦测：`esp_video_init()` 遍历链接进来的 detect 函数（Kconfig 使能的 sensor），
   I2C 探测成功即用。sensor 名：`dev->name`（"ov3660"/"SC101IOT"）。
