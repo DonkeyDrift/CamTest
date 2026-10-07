@@ -13,7 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "frame_ring.h"
-#include "camera_pipeline.h"
+#include "source_if.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "stream_srv";
@@ -83,7 +83,7 @@ static int send_all(int fd, const void *buf, size_t len)
 static void mjpeg_client_task(void *arg)
 {
     client_t *c = arg;
-    frame_ring_t *ring = cam_pipe_ring();   /* 环在 init 后永不销毁 */
+    frame_ring_t *ring = src_if_ring();   /* 环在 init 后永不销毁，跨源切换持续有效 */
     SemaphoreHandle_t notify = xSemaphoreCreateBinary();
     uint32_t last_fid = frame_ring_last_fid(ring);   /* 新客户端从下一帧开始，不给旧帧 */
     char hdr[512];
@@ -117,12 +117,18 @@ static void mjpeg_client_task(void *arg)
                          "X-Sensor: %s\r\n"
                          "X-Res: %ux%u\r\n"
                          "X-Quality: %u\r\n"
+                         "X-Source: %s\r\n"
+                         "X-Scaled: %u\r\n"
+                         "X-Ts-Meaning: %s\r\n"
                          "\r\n",
                          (unsigned)s->len, (unsigned long)s->fid,
                          (unsigned long long)s->t_capture_us,
                          (unsigned long long)s->t_encode_done_us,
-                         (unsigned)s->len, cam_pipe_info()->sensor_name,
-                         s->w, s->h, s->quality);
+                         (unsigned)s->len, src_if_info()->sensor_name,
+                         s->w, s->h, s->quality,
+                         src_if_source_name((video_source_t)s->source),
+                         s->scaled,
+                         src_if_ts_meaning_name((ts_meaning_t)s->ts_meaning));
         int rc = send_all(c->fd, hdr, n) || send_all(c->fd, s->data, s->len) ||
                  send_all(c->fd, "\r\n", 2);
         frame_ring_release(ring, s);
@@ -154,7 +160,7 @@ static void ws_send_frame(client_t *c, const frame_slot_t *s)
     memcpy(hdr + 24, &w, 2);
     memcpy(hdr + 26, &h, 2);
     hdr[28] = s->quality;
-    hdr[29] = 0;
+    hdr[29] = s->source;   /* 0=dvp 1=usb（网页 parseWsFrame 读取） */
     uint32_t len = s->len;
     memcpy(hdr + 30, &len, 4);
     /* 两段 copy（头 + 数据）各自 send 会破坏 WS 消息边界，必须一次发出 */
@@ -193,7 +199,7 @@ static void ws_send_frame(client_t *c, const frame_slot_t *s)
 static void ws_client_task(void *arg)
 {
     client_t *c = arg;
-    frame_ring_t *ring = cam_pipe_ring();
+    frame_ring_t *ring = src_if_ring();
     SemaphoreHandle_t notify = xSemaphoreCreateBinary();
     uint32_t last_fid = frame_ring_last_fid(ring);
     uint8_t rbuf[512];
@@ -272,7 +278,7 @@ static void udp_push_task(void *arg)
 
     struct sockaddr_in peer;
     bool subscribed = false;
-    frame_ring_t *ring = cam_pipe_ring();
+    frame_ring_t *ring = src_if_ring();
     SemaphoreHandle_t notify = xSemaphoreCreateBinary();
     uint32_t last_fid = 0;
     static uint8_t buf[40000];   /* 分片缓冲：静态分配（任务栈只有 4 kB） */
@@ -349,6 +355,8 @@ static void accept_task(void *arg)
         }
         struct timeval tv = { .tv_sec = SND_TIMEOUT_MS / 1000, .tv_usec = 0 };
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        int nd = 1;   /* 禁 Nagle：MJPEG 小包（part 头）不被凑包延迟（CSV tcp_nodelay=1） */
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
         c->fd = fd;
         strlcpy(c->ip, inet_ntoa(ca.sin_addr), sizeof(c->ip));
         strlcpy(c->pub.ip, c->ip, sizeof(c->pub.ip));

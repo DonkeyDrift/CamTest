@@ -13,6 +13,7 @@
 | 目标 | `esp32s31`（preview，需 `idf.py --preview set-target esp32s31`；bootloader 位于 0x2000） |
 | 摄像头组件 | espressif/esp_video **2.2.0** + espressif/esp_cam_sensor 2.2.x（V4L2 风格 API） |
 | 板级支持 | espressif/esp32_s31_korvo_1 **1.0.1**（其清单钉死 esp_video ~2.2，故锁定 2.2.0） |
+| USB UVC 组件 | espressif/usb_host_uvc **2.5.2** + espressif/usb **1.5.0**（IDF v6 起 USB Host 库入组件仓库；esp_video 2.2.0 对 p4/s3/s31 目标本身就依赖 usb_host_uvc ~2.5，版本由 lock 统一） |
 | 摄像头 | **以运行时侦测为准**（OV3660 或 SC101IOT，上电自动探测并打印型号，不硬编码） |
 | 组件版本注记 | registry API 已出现 esp_video 2.5.0，但组件存储索引滞后不可下载；2.5.0 的 m2m 示例（S31 默认 SC101IOT+MJPEG）对应更新版驱动，待可用后建议升级复测 |
 
@@ -35,8 +36,10 @@ idf.py -p /dev/cu.usbserial-1110 flash monitor   # macOS 串口名以实际为�
 ```
 
 > 进入下载模式（若自动复位失败）：按住 **Boot** → 点按 **Reset** → 松开 **Boot**。
-> 供电：默认 USB(UART) 口；高负载（720p/多客户端）建议同时从 **USB Type-C (Power)** 口补电，
-> 避免 500 mA 限流掉电重启。**Type-A 口是 Host-only，本系统不使用**（S31 无 UVC Device 方案）。
+> 供电：默认 USB(UART) 口；高负载（720p/多客户端/**USB 摄像头推流**）**必须**同时从
+> **USB Type-C (Power)** 口补电——Korvo-1 的 Type-A 座经 TPS2051C 限流 **500 mA**，
+> USB 摄像头（尤其 640×480 MJPEG 高帧率档）很容易撞限，典型症状是"枚举正常、一推流就掉线/
+> 重启/反复打开失败"。固件已实现掉线计数（`usb_disconnect_count`）与自动重连，UI 也有供电警告。
 
 ### 烧录后串口日志应看到（验收清单）
 
@@ -48,6 +51,19 @@ PSRAM: 16384 kB
 STA got IP: 192.168.x.x
 mDNS: http://korvo-s31.local
 pipeline: <sensor> <W>x<H> <fmt> q20 ...
+采集源就绪：DVP（默认）+ USB
+USB Host 就绪，未发现 UVC 设备（热插拔监听中；注意 Korvo-1 Type-A 口限流 500 mA）
+```
+
+插入 USB 摄像头后应看到（验收要求：完整描述符档位清单）：
+
+```
+===== UVC 设备已连接：name=1bcf:28c4 VID/PID=1bcf/28c4 addr=1 stream_idx=0 =====
+===== UVC 支持的 (格式, 分辨率, 帧率) 完整列表 =====
+  [0] MJPEG 640x480 default=30fps interval_type=3
+      interval[0]=333333 → 30fps ...
+===== 档位汇总：MJPEG=支持 YUY2=支持，共 N 档；默认模式=passthrough =====
+UVC 推流开始：MJPEG 640x480 quality=0 fps_limit=0
 ```
 
 ## 二、网络与 Web 界面
@@ -67,14 +83,18 @@ pipeline: <sensor> <W>x<H> <fmt> q20 ...
 
 ```
 X-Frame-Id / X-Capture-Us / X-Encode-Us / X-Jpeg-Len / X-Sensor / X-Res / X-Quality
+X-Source（dvp|usb）/ X-Scaled（0|1）/ X-Ts-Meaning（sensor_out|frame_arrival）
 ```
+
+`X-Ts-Meaning` 标注 `X-Capture-Us` 的语义（U4，两源严格可比的前提）：
+DVP 源 = 传感器输出时刻；USB 源 = **完整一帧到达 ESP32 的时刻**（已含摄像头内部延迟）。
 
 网页用 `fetch()` + `ReadableStream` 手动解析（不用 `<img src>`），在 part 头解析完成瞬间打
 `t_arrive_browser`，才能算端到端时延。
 
 ### WebSocket 二进制头（小端，36B）
 
-`MJP1 | u32 frame_id | u64 t_capture_us | u64 t_encode_us | u16 w | u16 h | u8 quality | u8 rsv | u32 jpeg_len | u16 rsv`
+`MJP1 | u32 frame_id | u64 t_capture_us | u64 t_encode_us | u16 w | u16 h | u8 quality | u8 source(0=dvp 1=usb) | u32 jpeg_len | u16 rsv`
 
 ### UDP 分片头（小端，24B，≤1200 B/片）
 
@@ -87,20 +107,33 @@ X-Frame-Id / X-Capture-Us / X-Encode-Us / X-Jpeg-Len / X-Sensor / X-Res / X-Qual
 |---|---|---|
 | `/api/sync?t_client=<us>` | GET | `{"t_dev_us","t_wall_ms"}`；设备在**即将写响应前**采样 esp_timer |
 | `/api/status` | GET | 设备侧实时指标 + 扫描进度/结果行（JSON） |
-| `/api/config` | POST | `{"res":"640x480","quality":20,"fps_limit":30,"overlay":true,"target_mbps":0}`；切分辨率重建链路，仅改质量走轻量路径 |
-| `/api/scan/start?modes=sta,ap` | GET | 启动扫描（默认仅当前网络模式） |
+| `/api/config` | POST | `{"source":"dvp\|usb","res":"640x480","quality":20,"fps_limit":0,"overlay":true,"target_mbps":0,"usb_mode":"passthrough\|reencode","usb_inherent_ms":12.3}`；切源失败自动回滚并返回 `ok:false`；仅改质量走轻量路径 |
+| `/api/scan/start?modes=sta,ap&scope=dvp\|usb\|both` | GET | 启动扫描（scope 默认 both；USB 不在线时 USB 组自动跳过并在状态中标注） |
 | `/api/scan/stop` | GET | 停止扫描 |
 | `/api/scan/result` | GET | 进度 + 全部结果行 |
 | `/api/scan/csv` | GET | 导出 CSV（表头见下） |
-| `/api/scan/report` | POST | 扫描期间浏览器侧每秒回传 `{arrival_fps,bitrate_mbps,latency_mean_ms,latency_p95_ms,latency_max_ms,latency_std_ms}` |
+| `/api/scan/report` | POST | 扫描期间浏览器侧每秒回传 `{arrival_fps,bitrate_mbps,latency_*}`；UDP 行由 `tools/udp_receiver.py --scan` 回传（另含 `udp_loss_rate,udp_incomplete_rate`） |
 
-CSV 表头（与任务书一致）：
+CSV 表头（U6 完整版；旧列全部保留、旧数据可继续按列名读取）：
 
 ```
-timestamp,sensor,resolution,quality,wifi_mode,bandwidth_mhz,rssi,capture_fps,encode_fps,arrival_fps,jpeg_avg_bytes,bitrate_mbps,latency_mean_ms,latency_p95_ms,latency_max_ms,latency_std_ms,encode_ms,cpu0_pct,cpu1_pct,free_heap,free_psram,drop_frames
+timestamp,video_source,sensor,usb_device_name,resolution,scaled,quality,usb_mode,protocol,
+tcp_nodelay,lcd_on,wifi_mode,bandwidth_mhz,rssi,capture_ts_meaning,
+capture_fps,encode_fps,arrival_fps,jpeg_avg_bytes,bitrate_mbps,
+latency_mean_ms,latency_p95_ms,latency_max_ms,latency_std_ms,encode_ms,
+usb_cam_inherent_latency_ms,usb_disconnect_count,
+cpu0_pct,cpu1_pct,free_heap,free_psram,drop_frames,udp_loss_rate,udp_incomplete_rate
 ```
 
-串口每秒输出聚合 CSV（无浏览器可用）：`CSV,<t_us>,cap_fps,enc_fps,send_fps,mbps,jpeg_avg,drop_cap,drop_enc,heap,psram,mode,rssi,WxH`；
+字段口径（防伪造约定）：
+- DVP 行：`video_source=dvp`、`usb_mode=n/a`、`capture_ts_meaning=sensor_out`、`usb_device_name` 空；
+- USB passthrough 行：`quality=passthrough`（**绝不伪造质量数值**，以 `jpeg_avg_bytes` 作等效画质指标）、
+  `capture_ts_meaning=frame_arrival`；
+- `usb_cam_inherent_latency_ms`：**只能**由光学闭环人工标定后经 `/api/config` 写入，未标定为空——设备侧不存在能直接测得该值的 API；
+- `protocol` 为扫描矩阵维度（http/ws/udp），`tcp_nodelay` 恒 1（流服务已设 TCP_NODELAY）、`lcd_on` 恒 0（本工程无 LCD 子板）。
+
+串口每秒输出聚合 CSV（无浏览器可用；末尾字段只增不改，旧脚本兼容）：
+`CSV,<t_us>,cap_fps,out_fps,send_fps,mbps,jpeg_avg,drop_cap,drop_out,heap,psram,mode,rssi,WxH,source,usb_mode`；
 扫描每组完成再输出一行 `SCAN,...` 摘要。
 
 ## 四、测试方法学与指标定义（可信度透明）
@@ -140,9 +173,24 @@ timestamp,sensor,resolution,quality,wifi_mode,bandwidth_mhz,rssi,capture_fps,enc
 | 网络+浏览器段 | **估算** | = 端到端 − 编码耗时 |
 | Wi-Fi RSSI/信道/PHY | 设备侧实测 | `esp_wifi_sta_get_ap_info`；**无公开 API 拿当前链路速率**（见待核实清单） |
 
-### 自动扫描（闭环）
+### 自动扫描（闭环，按采集源分组）
 
-矩阵 = 6 档分辨率（160×120 ~ 1280×720，sensor 不支持的标 `unsupported` 并跳过）。
+矩阵按源分化（U8，两源的可控维度不同）：
+
+| 源 | 分辨率 | 质量 | 协议 | 组数 | 说明 |
+|---|---|---|---|---|---|
+| DVP | 160×120 / 320×240 / 640×480 | 10 / 20 / 30 | http / ws / udp | 27 | 质量→码率严格可控 |
+| USB 直通 | 摄像头 MJPEG 原生档（动态枚举） | passthrough（不可控） | http / ws / udp | 档数×3 | 以 jpeg_avg_bytes 作等效画质指标 |
+| USB 重编码 | 摄像头 YUY2 原生档（动态枚举） | 10 / 20 / 30 | http / ws / udp | 档数×9 | 与 DVP 同质量档严格可比 |
+
+- 范围可选 `scope=dvp / usb / both`（UI 下拉，默认 both）；USB 不在线时 USB 组整组跳过并在状态标注 `usb_skipped`；
+- USB 组扫描前先从 UVC 描述符枚举档位，不支持的档不进矩阵；DVP 组不支持的档照旧标 `unsupported`；
+- **协议是扫描维度**：浏览器根据当前行自动切换 http/ws（`/api/status` 的 `scan.cur_protocol` 驱动）；
+  udp 行由 `tools/udp_receiver.py --scan` 回传（浏览器无法收 UDP）；
+- 扫描全程 LCD 默认关闭（本工程无 LCD 子板，`lcd_on=0`）；
+- UI 显示两级进度（当前源 / 当前组），结束后自动汇总「DVP vs USB」对比表。
+
+DVP 分辨率档位与虚拟分辨率机制（软件抽取/裁剪）：
 
 **虚拟分辨率（软件抽取/裁剪）**：sensor 驱动原生档位有限（OV3660 只有 240×240/640×480），
 本固件在"采集→编码"之间加入软件映射，使低分辨率档可用：
@@ -181,25 +229,110 @@ UI 下拉列表自动列出全部可达成档位，`fmt` 字段标注来源。
 **本组件版本（esp_cam_sensor 2.2.x）驱动格式表较窄**：SC101IOT 仅 720p@15/25（UYVY/YUYV），
 OV3660 仅 240×240@24 与 640×480@10（YUYV/RGB565）——矩阵中其余档位会如实标 unsupported（见待核实清单）。
 
+## 四点五、USB UVC 采集通路（第二条采集链路）
+
+### 1. 可行性验证结论（先行验证，结论如下）
+
+按任务书第七节要求，先做源码级可行性侦察再动手（2026-10-07，全部结论读自本地
+`managed_components` 实际源码，非官方文档转述）：
+
+| 验证项 | 结论 |
+|---|---|
+| `usb_host_uvc` 组件与 S31 | ✅ espressif/usb_host_uvc **2.5.2**（esp-usb 仓库 `host/class/uvc/usb_host_uvc`），targets 显式含 `esp32s31`；esp_video 2.2.0 的组件清单对 esp32p4/s3/s31 固定依赖 `usb_host_uvc 2.5.*`，`dependencies.lock` 已解析 2.5.2 + espressif/usb 1.5.0（`usb_host_install` 的 `peripheral_map=0` 在 HS capable 目标默认走 High-Speed 外设） |
+| esp_video 的 `/dev/video40` V4L2 封装 | ⚠️ **存在但未采用**。esp_video 2.2.0 确有 `ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE`（设备号 40..49，`uvc_to_v4l2_format` 支持 MJPEG/YUY2），但其断线语义有缺陷：设备拔出后 `uvc_video_stop()`/`uvc_video_deinit()` 因 `dev_addr==0` **提前返回 `ESP_ERR_NOT_FOUND`** → `esp_video_close()` 不清 `inited` 标志、`uvc_host_stream_close()` 永不被调用 → **每次拔插泄漏一条 stream（URB 为内部 RAM）**；且 open 时会同步阻塞等待枚举（默认 10 s）。不满足"拔插 3 次不卡死、自动重连"的验收标准 |
+| 最终路线 | ✅ **按任务书预留的降级路线：直接使用 usb_host_uvc 原生 API**，封装进与 DVP 完全一致的采集源接口（`source_usb.c`）。其 `uvc_host_stream_close()` 对死设备容错（stop 的控制传输错误被忽略，全部帧归还后 `uvc_device_remove()` 释放 stream+URB），断线可干净回收。esp_video 的 UVC Kconfig 保持关闭（`sdkconfig.defaults` 显式 `is not set`），避免双重 `usb_host_install` |
+| 设备识别 | `usb_host_device_open()` + `usb_host_get_device_descriptor()` 取 VID/PID（UI/CSV 显示 `vid:pid`，如 `1bcf:28c4`）。usb 1.5.0 **无字符串描述符公共 API**，iProduct 产品名暂不取（见待核实清单 #9） |
+| 档位枚举 | `uvc_host_get_frame_list(dev_addr, stream_idx, ...)` 直接返回描述符解析后的 (格式， 分辨率， 帧间隔) 全表——启动/插入即打印完整清单并生成 UI 档位列表 |
+
+> 真机最小验证（枚举/取帧/帧长/实测帧率）需在板上进行：烧录后插 USB 摄像头，
+> 串口即打印上述清单与 `UVC 推流开始`，Web UI 显示画面即为通过。接口层已按
+> 官方 `basic_uvc_stream` 示例的调用序列编写（open→format_select(fps=0 默认)→start）。
+
+### 2. 两种工作模式（U2，数据中必须区分）
+
+| | 模式 A：passthrough（默认，主推） | 模式 B：reencode |
+|---|---|---|
+| 链路 | 摄像头 MJPEG → ESP32 **原样转发** | 摄像头 YUY2 → ESP32 换序/缩放/OSD → **S31 硬件 JPEG** → 转发 |
+| 画质可控性 | ❌ 由摄像头固件决定，ESP32 不可调。CSV `quality=passthrough`，**不伪造数值**，以 `jpeg_avg_bytes` 作等效画质指标 | ✅ `quality` 1~100 可控，与 DVP 同档严格可比 |
+| 预期延迟/CPU | 最低（省整个编码环节） | 略高（多一次编码 + YUY2 大流量） |
+| OSD 光学闭环 | ❌ 不可用（不解码无法烧录计数器） | ✅ 叠加在"帧到达后、编码前"，光学校验测的是真实端到端 |
+| CSV `usb_mode` | `passthrough` | `reencode` |
+
+启动/切换时自动读描述符：优先 MJPEG（→passthrough 可用）；无 MJPEG 档的摄像头 fallback
+YUY2（→reencode），日志与 UI 均明确当前模式。模式切换 `POST /api/config {"usb_mode":...}`，
+失败自动回滚原模式。
+
+### 3. 时间戳语义（U4，本次度量学核心）
+
+**USB 源的 `t_capture_us` = 完整一帧到达 ESP32 的时刻**（`frame_cb` 打点，即 UVC 帧边界
+EAV 处理完成时刻），它已经包含摄像头内部不透明延迟：
+
+```
+[传感器曝光 + 摄像头内部 ISP + 摄像头内部 JPEG 编码(passthrough 才有) + USB 传输]  ← 不可见不可控，数 ms~数十 ms
++ [ESP32 处理：直通=拷贝转发(≈0)；重编码=换序/缩放/硬件编码（精确计时 enc_us = t_encode − t_capture）]
++ [网络传输 + 浏览器解码渲染（时钟同步法，估算）]
+```
+
+- CSV 用 `capture_ts_meaning` 区分：DVP=`sensor_out`，USB=`frame_arrival`。**两源数据同列可比的前提
+  是承认这个语义差**——对比表中 USB 的延迟天然偏大摄像头内部那一段，不是链路劣化；
+- UI 三段拆分展示（哪段是估算已标注）：① 摄像头内部（估算/标定值） ② ESP32 处理（精确实测） ③ 网络+浏览器（估算 = 端到端 − ②，①未标定时该项含①）。
+
+**摄像头内部固有延迟（`usb_cam_inherent_latency_ms`）为何只能估**：设备侧任何 API 都拿不到
+"传感器曝光完成时刻"，唯一入口是光学闭环——
+
+```
+标定流程（reencode 模式，≥10 次采样）：
+  1. /overlay 开启画面毫秒叠加（叠加发生在"帧到达 ESP32 之后"）
+  2. 摄像头对准另一块屏的毫秒计时器，连拍 ≥10 张流画面
+  3. 光学端到端 = 照片中（屏幕计时 − 画面内设备计数）
+  4. 摄像头内部延迟 ≈ 光学端到端 − 同条件软件法端到端（时钟同步法）
+  5. POST /api/config {"usb_inherent_ms": <均值>} 写入 → CSV 填该值，UI 三段拆分启用
+误差：光学法本身 ±17 ms（60 Hz 屏幕刷新半格 + 读数），建议 20+ 张取均值；
+      passthrough 与 reencode 的内部延迟差 ≈ 摄像头内部 JPEG 编码耗时，可用两模式各自标定后差分
+```
+
+### 4. 分辨率/帧率档位（U3）
+
+- 描述符枚举的**全部 (格式, 分辨率, 帧率)** 在插入时打印到串口，UI 的 USB 面板列表展示（全部为"原生"档）；
+- passthrough 只接受**原生精确档**（不解码所以不能缩放）；reencode 可用 YUY2 原生档向下的
+  虚拟档（整数抽取/中心裁剪，UI 标"（缩放）"，帧级 `X-Scaled`/CSV `scaled` 同步标注，源分辨率见 `/api/status` 的 `native`）；
+- 扫描矩阵只包含原生档（DVP 侧虚拟档机制保持不变）；`fps=0` 表示用摄像头默认帧间隔
+  （描述符 `default_interval`），实测帧率以到达 FPS 为准。
+
+### 5. 热插拔 / 掉线 / 供电（U5）
+
+- 自建 USB Host client 收 `NEW_DEV`/`DEV_GONE`（广播事件）+ 开机补扫地址列表（client 注册
+  不回放已连接设备）→ 掉线即 `usb_disconnect_count++`；
+- 断线清理顺序（防泄漏）：暂停流 → 归还全部帧缓冲（`uvc_host_frame_return`）→ `uvc_host_stream_close`
+  （死设备容错）→ 关编码器。重新插入后若 USB 是当前源则**自动重连**（1 s 退避重试）；
+- 打开/协商反复失败进入 `error` 状态——**首先检查供电**（Type-C 口补电），固件日志与 UI 均提示。
+
 ## 五、软件架构
 
 ```
 main/
-├── main.c            初始化顺序 + 看护（Wi-Fi 断连重启 / 编码停滞自动重建链路）
+├── main.c            初始化顺序 + 看护（Wi-Fi 断连重启 / DVP 编码停滞重建 / USB 状态播报）
+├── source_if.c       ★ 统一采集源调度（U1）：vtable 分发 + 热切换（失败回滚）+ USB 查询转发
+├── source_dvp.c      DVP 后端 = camera_pipeline 的薄适配（原通路零改动）
+├── source_usb.c      USB 后端：usb_host_uvc 原生 API + 热插拔自动重连 + 两模式（见「USB UVC 采集通路」）
 ├── camera_pipeline.c DVP 采集 → 硬件 JPEG(M2M) → 帧环；分辨率切换重建；三任务流水
-├── frame_ring.c      最新帧环形发布/订阅（PSRAM + 引用计数；丢帧式，不堆积）
-├── yuv_osd.c         5x7 毫秒计数器叠加（光学闭环）
+├── frame_ring.c      最新帧环形发布/订阅（PSRAM + 引用计数；丢帧式；槽带 source/scaled/ts_meaning 元数据）
+├── yuv_osd.c         5x7 毫秒计数器叠加（光学闭环；USB 仅 reencode 模式可叠加）
 ├── wifi_net.c        STA/SoftAP + mDNS + RSSI/PHY + SNTP(可选)
-├── stream_server.c   :81 原生 socket 流服务（/stream、/ws、UDP 分片），每客户端独立任务
-├── http_server.c     :80 管理 API（esp_http_server）
-├── metrics.c         每秒聚合（FPS/码率/CPU/内存/栈水位）+ 串口 CSV + 码率自适应降质
-├── scan_ctrl.c       扫描状态机（warmup/采样/结果行/CSV）
-├── web_ui.c / fs_web/index.html   内嵌单页 UI（EMBED_FILES，离线可用）
+├── stream_server.c   :81 原生 socket 流服务（/stream、/ws、UDP 分片），每客户端独立任务，TCP_NODELAY
+├── http_server.c     :80 管理 API（esp_http_server；含 USB 状态/档位/标定值）
+├── metrics.c         每秒聚合（FPS/码率/CPU/内存/栈水位）+ 串口 CSV + 码率自适应降质（直通模式仅告警）
+├── scan_ctrl.c       扫描状态机（按源分组矩阵 / 两级进度 / 完整 CSV 表头）
+├── web_ui.c / fs_web/index.html   内嵌单页 UI（EMBED_FILES，离线可用；源切换/USB 面板/三段时延/对比视图）
 docs/API_NOTES.md     esp_video/BSP 源码侦察笔记（API 均有出处）
 tools/pi_compare.py   第三方对照测量（HTTP 流，时钟同步法，同口径）
-tools/udp_receiver.py UDP 分片接收端
+tools/udp_receiver.py UDP 分片接收端（--scan 模式供扫描 UDP 行回传）
 RESULTS_TEMPLATE.md   实测数据回填模板（Markdown 表 + CSV 表头）
 ```
+
+上层（编码/传输/度量/扫描/UI）只依赖 `source_if.h`；新增采集源只需实现 vtable 并在
+`source_if.c` 注册，不动任何上层逻辑。帧环跨源共享且永不销毁——切换采集源时流客户端
+持续收帧（fid 连续），无断流。
 
 并发设计要点：采集（core1 高优先级）/编码（core1 中）/网络发送（core0 低）三级流水；
 发送端只取最新帧（丢帧保时延）；帧缓冲/编码输出/客户端发送缓冲全 PSRAM；
@@ -233,10 +366,47 @@ RESULTS_TEMPLATE.md   实测数据回填模板（Markdown 表 + CSV 表头）
 | 6 | LCD 子板（ESP32-S3-LCD-EV-Board-SUB3）本地叠加 | 未接硬件；BSP 支持 display（esp_lvgl_port），接口已预留，暂不默认编译 |
 | 7 | 编码器 40 ms 单帧超时在 720p 下的真实余量 | 实测见 RESULTS_TEMPLATE（若 720p 频繁错误帧，属驱动常量限制） |
 | 8 | `esp_video_get_dvp_video_device_sensor()` 为私有 API | 2.2.0 固定版本下稳定；升级组件时需复查（CMake 已隔离 include 路径） |
+| 9 | UVC 摄像头 **iProduct 产品名** | espressif/usb 1.5.0 无字符串描述符公共 API（`usb_host_get_string_descriptor` 不存在）；现以 `vid:pid` 代替（如 `1bcf:28c4`）。若需要真名须自行提交控制传输 GET_DESCRIPTOR(String)，见 `source_usb.c` TODO |
+| 10 | USB HS DMA 与 DVP GDMA/Wi-Fi/LCD 的 **PSRAM 总线争抢** | 架构上确有共存路径（USB 帧缓冲/帧环/编码缓冲全 PSRAM），量化数据待真机：对比 USB 推流前后 Wi-Fi 空闲 RTT 与 DVP 编码耗时即可判定；结果记入 RESULTS_TEMPLATE |
+| 11 | USB 摄像头**内部固有延迟标定值** | 需按「USB UVC 采集通路 §3」流程真机标定（≥10 采样），写入后 CSV 才有值；设备侧绝不自动生成 |
+| 12 | 各型号 UVC 摄像头兼容性（MJPEG 档位真伪、dwMaxVideoFrameSize 虚标） | usb_host_uvc 按协商值分配帧缓冲可容忍虚标；但个别摄像头只报 YUY2 或帧率虚标——上电串口清单即判真伪 |
+| 13 | esp_video 2.5.x 的 UVC V4L2 封装是否修复了断线缺陷 | 未验证（2.5.0 组件存储不可用）；修复后可评估切回 V4L2 统一通路（设备节点 `/dev/video40` 代码路径已侦察完毕） |
+
+## 七点五、USB UVC 采集源（第二通路，source_if 统一源架构）
+
+固件内置统一采集源抽象（`main/source_if.*`）：上层（传输/度量/扫描/UI）不感知底层实现，
+DVP 与 USB UVC 可运行时热切换（`POST /api/config {"source":"usb"|"dvp"}`，切换失败自动回滚原源，
+绝不处于双源皆停状态）。
+
+- **硬件**：Korvo-1 的 USB Type-A 座（USB 2.0 HS 480 Mbps，Host-only，经 TPS2051C 限流 500 mA）。
+  推流时建议同时从 Type-C (Power) 口补供电。
+- **驱动选型**：`usb_host_uvc 2.5.2` 原生 API。**不走** esp_video 的 `/dev/video40` V4L2 封装——
+  源码侦察发现其断线去初始化路径存在资源泄漏与状态卡死（`uvc_video_deinit` 在 dev_addr==0 时
+  提前返回，`uvc_host_stream_close` 永不被调用；open 还会同步阻塞等待枚举 10 s），不满足
+  "拔插 3 次不卡死 + 自动重连"；原生 API 对死设备容错（帧全归还后 remove 释放全部资源）。
+- **两种工作模式**（UI「USB 模式」或 `/api/config usb_mode`）：
+  - `passthrough`：摄像头内部 MJPEG 直通（不解不编，延迟/CPU 最优；**画质不可控**，quality 显示 0）；
+  - `reencode`：YUY2 → S31 硬件 JPEG（质量可控，带宽压力更大）。
+- **时延语义**（`capture_ts_meaning` 字段，UI/CSV 均标注）：DVP 的 `t_capture` = 传感器输出时刻；
+  USB 的 `t_capture` = **完整一帧到达 ESP32 时刻**（含摄像头内部曝光/ISP/编码/USB 传输的不可见延迟）。
+  该"摄像头内部固有延迟"用光学闭环标定后经 `/api/config {"usb_inherent_ms":…}` 写入，
+  UI 时延拆分栏按 ①摄像头内部(估算) ②ESP32 处理(精确) ③网络+浏览器(估算) 三段展示。
+- **状态机**：`no_device / device_ready / streaming / error`（典型 error 诱因：供电不足），
+  掉线自动重连并计数（`usb_disconnect_count`）。
+- **扫描矩阵**已扩展：CSV 新增 `video_source/sensor/usb_device_name/scaled/usb_mode/protocol/
+  tcp_nodelay/lcd_on/capture_ts_meaning/usb_cam_inherent_latency_ms/usb_disconnect_count/
+  udp_loss_rate/udp_incomplete_rate` 等列（DVP 行 usb 列填 n/a/0）。
 
 ## 八、已知限制
 
-- 本板 **Type-A USB 为 Host-only**，无法做 UVC Device → 纯 Wi-Fi 方案（任务书约束）。
+- 本板 **Type-A USB 为 Host-only**：作为 **Host 接 UVC 摄像头**（本工程 USB 通路）没有问题；
+  只是做不了 UVC Device（把画面喂给 PC）。
+- USB **passthrough 模式无法叠加 OSD**（不解码）——光学校验请在 reencode 模式做，
+  两种模式的摄像头内部延迟差即摄像头内部 JPEG 编码耗时（可各自标定后差分）。
+- USB 摄像头多数**不支持 160×120**（通常最低 320×240 或 176×144）：DonkeyCar 若以 160×120
+  为推理输入，DVP 的软件抽取档可直接给，USB 直通档位以描述符枚举为准（reencode 可经缩放给到 160×120）。
+- USB passthrough 的画质/帧率/曝光策略由摄像头固件决定，本系统**无法干预也无法如实上报
+  其"质量值"**（CSV 以 passthrough+jpeg_avg_bytes 表达，属设计约束而非缺陷）。
 - DVP 无硬件缩放、sensor 驱动（2.2.x）无 windowing 配置 → 低分辨率通过**软件抽取/裁剪**实现；
   高帧率（60~93fps）通过**时钟树移植 + V 窗口裁剪**实现（推导与实测见上节）。代价均为视场/形变，
   无失真全视场的帧率上限是 31fps（L1）——再往上必须裁 V 窗口，这是 OV3660+DVP 的物理约束。
@@ -290,3 +460,37 @@ RESULTS_TEMPLATE.md   实测数据回填模板（Markdown 表 + CSV 表头）
 - 扫描矩阵结果：160×120/320×240/480×320/640×480 十六组全部可跑（虚拟分辨率路径，零丢帧）；
   800×600/1280×720 两档在 OV3660 上如实标记 unsupported（需要放大或更高原生传感器；
   插 SC101IOT 后 1280×720 原生 UYVY 可用）。
+
+### DonkeyCar 选型建议（DVP vs USB UVC）
+
+> 结论分两层：**结构性判断**（现在就能给，基于链路结构与已实测 DVP 数据）与
+> **数据确认项**（USB 组真机数据回填后复核，模板见 RESULTS_TEMPLATE.md 的 USB 节）。
+> 未标注"实测"的数字一律是结构推导，不是测量值——不接受把估算包装成实测。
+
+**结构性判断（当前证据下成立）**
+
+1. **延迟结构**：USB 通路把"摄像头内部延迟"（曝光+ISP+摄像头内编码+USB 传输，估计 15~50 ms 量级，
+   随型号差异大）折进了端到端；DVP 的 t_capture 是传感器输出时刻，这段不受控因素为 0。
+   即使 USB passthrough 省掉 S31 侧编码（DVP 在 160×120 时编码段仅 ~2 ms，实测），省掉的
+   2 ms 很难抵消摄像头内部十几 ms 的不透明延迟——**低延迟 FPV 首选 DVP 的结构性理由**。
+   是否反超，待 USB 组光学标定数据回填（RESULTS_TEMPLATE USB 节）后复核。
+2. **分辨率下限**：DonkeyCar 常用 160×120 推理输入。DVP 可由 240×240/640×480 软件抽取/裁剪
+   直接给到 160×120（实测 60fps@L2 甚至 93fps@L4）；USB 摄像头绝大多数最低 320×240，
+   直通模式拿不到 160×120（reencode 经缩放可以，但多付一次编码）。
+3. **体积/安装/供电/成本**：DVP 摄像头是板上排线一体（OV3660，0 元成本、零额外安装、
+   由主口供电即可）；USB 摄像头需外加（¥30~100+）、占 Type-A 座、**大概率需要 Power 口
+   补电**（500 mA 限流），车模布线与配重都要考虑。
+4. **画质与码率**：DVP 的 quality 严格可控且已实测各档码率（160×120 q20 ≈ 0.58 Mbps）；
+   USB passthrough 画质/曝光策略是黑盒（CSV 以 passthrough+jpeg_avg_bytes 表达），
+   对需要一致训练数据的 DonkeyCar 是额外变量。
+
+**USB 通路的真实优势（什么场景该用它）**
+
+- 需要**更高分辨率/更高画质**的记录视角（720p/1080p MJPEG 摄像头直通，S31 侧近零开销）；
+- DVP 排线损坏/换装不便的现成 USB 摄像头复用；
+- 需要摄像头端变焦/自动对焦等 DVP 方案没有的能力。
+
+**最终建议**：DonkeyCar FPV/推理主链路用**板载 DVP**（延迟结构最优、160×120 原生可达、
+零增量成本与供电风险）；USB UVC 作为**高分辨率记录/备选链路**保留——本工程已把两路
+纳入同一度量与扫描体系，插上摄像头跑一次 `scope=both` 扫描即可得到本车环境下的
+逐项对比数据，替换选型无需改代码。

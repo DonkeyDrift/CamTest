@@ -46,6 +46,14 @@ void frame_ring_destroy(frame_ring_t *r)
 bool frame_ring_publish(frame_ring_t *r, const uint8_t *jpeg, size_t len,
                         uint64_t t_cap, uint64_t t_enc, uint16_t w, uint16_t h, uint8_t q)
 {
+    const frame_meta_t meta = { .source = FRAME_SRC_DVP, .scaled = 0, .ts_meaning = FRAME_TS_SENSOR_OUT };
+    return frame_ring_publish_ex(r, jpeg, len, t_cap, t_enc, w, h, q, &meta);
+}
+
+bool frame_ring_publish_ex(frame_ring_t *r, const uint8_t *jpeg, size_t len,
+                           uint64_t t_cap, uint64_t t_enc, uint16_t w, uint16_t h, uint8_t q,
+                           const frame_meta_t *meta)
+{
     /* 1) 选坑：refcnt==0 且不在写入中；优先 inactive，其次最旧 */
     frame_slot_t *victim = NULL;
     xSemaphoreTake(r->lock, portMAX_DELAY);
@@ -75,6 +83,9 @@ bool frame_ring_publish(frame_ring_t *r, const uint8_t *jpeg, size_t len,
     victim->t_capture_us = t_cap;
     victim->t_encode_done_us = t_enc;
     victim->w = w; victim->h = h; victim->quality = q;
+    victim->source = meta ? meta->source : FRAME_SRC_DVP;
+    victim->scaled = meta ? meta->scaled : 0;
+    victim->ts_meaning = meta ? meta->ts_meaning : FRAME_TS_SENSOR_OUT;
     victim->fid = ++r->next_fid;
     victim->active = true;
     victim->writing = false;

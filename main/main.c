@@ -19,27 +19,28 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
-#include "camera_pipeline.h"
+#include "source_if.h"
 #include "wifi_net.h"
 #include "stream_server.h"
 #include "http_server.h"
 #include "metrics.h"
 #include "scan_ctrl.h"
-#include "http_server.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "main";
 
 static void cam_watch_task(void *arg)
 {
-    uint32_t last_enc_frames = 0;
+    uint32_t last_out_frames = 0;
     uint32_t last_cap_frames = 0;
-    int enc_stall = 0;
-    uint32_t last_enc_seen = 0;
+    int out_stall = 0;
     int64_t wifi_down_since = 0;
+    usb_state_t last_usb_state = USB_STATE_NO_DEVICE;
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(5000));
-        cam_pipe_stats_t *ps = cam_pipe_stats();
+        src_stats_t *ps = src_if_stats();
+        src_info_t *ci = src_if_info();
         wifi_info_t *w = wifi_net_info();
 
         /* Wi-Fi 看护 */
@@ -53,26 +54,35 @@ static void cam_watch_task(void *arg)
             wifi_down_since = 0;
         }
 
-        /* 编码停滞看护：采集在走但编码卡死 → 重建链路 */
-        if (ps->cap_frames > last_cap_frames && ps->enc_frames == last_enc_frames) {
-            enc_stall++;
-            if (enc_stall == 3) {   /* ~15 s 无编码输出 */
-                ESP_LOGE(TAG, "encode stalled (cap=%u enc=%u) → rebuild pipeline",
-                         (unsigned)ps->cap_frames, (unsigned)ps->enc_frames);
-                last_enc_seen = esp_timer_get_time() / 1000000;
-                esp_err_t err = cam_pipe_apply(0, 0, 0, 0);
-                enc_stall = (err == ESP_OK) ? 0 : enc_stall;
-                if (err != ESP_OK && ++enc_stall >= 6) {
-                    ESP_LOGE(TAG, "rebuild failed repeatedly, reboot");
-                    esp_restart();
+        if (ci->source == VIDEO_SOURCE_DVP) {
+            /* DVP 编码停滞看护：采集在走但编码卡死 → 重建链路（USB 源有自己的 monitor） */
+            if (ps->cap_frames > last_cap_frames && ps->out_frames == last_out_frames) {
+                out_stall++;
+                if (out_stall == 3) {   /* ~15 s 无输出 */
+                    ESP_LOGE(TAG, "encode stalled (cap=%u out=%u) → rebuild pipeline",
+                             (unsigned)ps->cap_frames, (unsigned)ps->out_frames);
+                    esp_err_t err = src_if_apply(0, 0, 0, 0);
+                    out_stall = (err == ESP_OK) ? 0 : out_stall;
+                    if (err != ESP_OK && ++out_stall >= 6) {
+                        ESP_LOGE(TAG, "rebuild failed repeatedly, reboot");
+                        esp_restart();
+                    }
                 }
+            } else {
+                out_stall = 0;
             }
         } else {
-            enc_stall = 0;
+            /* USB 源状态播报（自动重连由 source_usb monitor 负责） */
+            usb_state_t us = src_if_usb_state();
+            if (us != last_usb_state) {
+                static const char *names[] = { "disabled", "no-device", "ready", "streaming", "error" };
+                ESP_LOGW(TAG, "USB 源状态：%s%s", names[us],
+                         us == USB_STATE_ERROR ? "（反复打开失败？检查供电：Type-C 口补电）" : "");
+                last_usb_state = us;
+            }
         }
-        last_enc_frames = ps->enc_frames;
+        last_out_frames = ps->out_frames;
         last_cap_frames = ps->cap_frames;
-        (void)last_enc_seen;
 
         if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < 512 * 1024) {
             ESP_LOGW(TAG, "PSRAM low: %u kB", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
@@ -94,9 +104,10 @@ void app_main(void)
     /* Wi-Fi（STA 默认，失败回退 SoftAP） */
     ESP_ERROR_CHECK(wifi_net_start());
 
-    /* 摄像头管线：传感器侦测 + 采集/编码任务 */
-    ESP_ERROR_CHECK(cam_pipe_init());
-    cam_pipe_start();
+    /* 采集源抽象层：DVP 后端初始化（BSP 上电 + sensor 侦测）+ USB 后端（热插拔监听），
+     * 默认源 DVP（与原行为一致）；USB 切换经 /api/config 或 UI 下拉框 */
+    ESP_ERROR_CHECK(src_if_init());
+    src_if_switch(VIDEO_SOURCE_DVP);   /* 启动 DVP 采集/编码任务 */
     ESP_ERROR_CHECK(scan_ctrl_init());
 
     /* 网络服务 */

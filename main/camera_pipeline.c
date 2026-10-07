@@ -616,6 +616,9 @@ esp_err_t cam_pipe_init(void)
         ESP_LOGE(TAG, "no encodable format for ring sizing");
         return ESP_ERR_NOT_SUPPORTED;
     }
+    /* USB UVC 共用此帧环：部分摄像头 640x480 MJPEG 帧可超过 DVP 口径（238KB），
+     * 抬高槽容量下限（PSRAM 16MB 充裕；槽只增不改，帧环永不销毁） */
+    if (max_cap < 384 * 1024) max_cap = 384 * 1024;
     s_p.ring = frame_ring_create(3, max_cap);
     ESP_RETURN_ON_FALSE(s_p.ring, ESP_ERR_NO_MEM, TAG, "frame ring %ukB x3", (unsigned)(max_cap / 1024));
     s_p.free_in = xQueueCreate(JPEG_IN_BUFS, sizeof(int));

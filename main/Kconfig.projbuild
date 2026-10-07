@@ -73,6 +73,26 @@ menu "CamTest Configuration"
             bool "L4: ~87fps（垂直视场 33%，纵向拉伸 ×3.1）"
     endchoice
 
+    config CAMTEST_ENABLE_USB
+        bool "启用 USB UVC 摄像头采集通路（usb_host_uvc 原生 API，热插拔）"
+        default y
+        help
+            第二条采集通路：USB Host (HS 480 Mbps) + usb_host_uvc 2.5.2。
+            走原生 API 而非 esp_video 的 /dev/video40 V4L2 封装（后者断线
+            去初始化有资源泄漏缺陷，见 README「可行性结论」）。
+            ⚠️ Korvo-1 的 Type-A 座经 TPS2051C 限流 500 mA，推流时建议
+            用 Type-C (Power) 口补供电。
+
+    choice CAMTEST_USB_DEFAULT_MODE
+        prompt "USB 摄像头默认工作模式"
+        default CAMTEST_USB_MODE_PASSTHROUGH
+        depends on CAMTEST_ENABLE_USB
+        config CAMTEST_USB_MODE_PASSTHROUGH
+            bool "passthrough（MJPEG 直通，延迟/CPU 最优；画质由摄像头固件决定）"
+        config CAMTEST_USB_MODE_REENCODE
+            bool "reencode（YUY2 → 硬件 JPEG，质量可控；带宽压力更大）"
+    endchoice
+
     config CAMTEST_SCAN_WARMUP_MS
         int "扫描每组 warmup 时长 ms"
         default 2000

@@ -21,6 +21,7 @@ udp_receiver.py — CamTest UDP 分片图传接收端（探索时延下限用，
 
 用法：
     python3 udp_receiver.py --host korvo-s31.local --duration 20 --csv udp.csv
+    python3 udp_receiver.py --host korvo-s31.local --scan   # 扫描模式：常驻并每秒 POST /api/scan/report
 
 输出：每 5 s 一次实时统计；结束打印汇总（fps / 时延 / 丢片率 / 码率）。
 时延计算先通过 HTTP /api/sync 做时钟同步（同 pi_compare.py）。
@@ -58,6 +59,72 @@ def sync_clock(host, http_port, n=8):
     return sorted(p[1] for p in probes[:3])[1]
 
 
+def scan_loop(sock, ip, args):
+    """扫描模式：每 1 s 一个统计窗，回传 /api/scan/report（含 udp_loss_rate/udp_incomplete_rate）。
+    扫描行切换由设备侧状态机决定；本脚本只按窗口回传，Ctrl-C 退出。"""
+    import requests as rq
+    sock.settimeout(0.2)
+    sock.sendto(b"SUBSCRIBE\n", (ip, args.udp_port))
+    print("scan 模式：回传 /api/scan/report（Ctrl-C 退出）", file=sys.stderr)
+    frames, win_done, win_lost = {}, 0, 0
+    win_lat = []
+    t_win = time.time()
+    last_sub = time.time()
+    try:
+        while True:
+            try:
+                data, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                if time.time() - last_sub > 1.0:
+                    sock.sendto(b"SUBSCRIBE\n", (ip, args.udp_port))
+                    last_sub = time.time()
+            else:
+                if len(data) >= HDR.size:
+                    magic, fid, cap, idx, total, flen, flags = HDR.unpack_from(data)
+                    if magic == MAGIC:
+                        fr = frames.setdefault(fid, {"total": total, "parts": set(), "cap": cap,
+                                                     "t_last_frag": time.time() * 1e6})
+                        fr["parts"].add(idx)
+                        if flags & 0x2 and len(fr["parts"]) == total:
+                            win_done += 1
+                            win_lat.append((time.time() * 1e6 - fr["cap"] + offset) / 1000.0)
+                            frames.pop(fid, None)
+            if time.time() - t_win >= 1.0:
+                # 窗口结算：超龄未完成帧计入 incomplete
+                stale = [k for k, fr in frames.items() if len(fr["parts"]) < fr["total"]]
+                incomplete = len(stale)
+                for k in stale:
+                    frames.pop(k)
+                    win_lost += 1
+                total_frames = win_done + incomplete
+                body = {
+                    "arrival_fps": win_done,
+                    "bitrate_mbps": 0,   # 码率由设备侧统计，回传仅作参考
+                    "udp_loss_rate": round(win_lost / total_frames * 100, 2) if total_frames else 0,
+                    "udp_incomplete_rate": round(incomplete / total_frames * 100, 2) if total_frames else 0,
+                }
+                if len(win_lat) >= 2:
+                    body.update({
+                        "latency_mean_ms": round(statistics.mean(win_lat), 2),
+                        "latency_p95_ms": round(sorted(win_lat)[min(len(win_lat) - 1, int(0.95 * len(win_lat)))], 2),
+                        "latency_max_ms": round(max(win_lat), 2),
+                        "latency_std_ms": round(statistics.stdev(win_lat), 2),
+                    })
+                win_lat = []
+                if total_frames:
+                    try:
+                        rq.post(f"http://{ip}:{args.http_port}/api/scan/report",
+                                json=body, timeout=2)
+                    except Exception:
+                        pass
+                win_done, win_lost = 0, 0
+                t_win = time.time()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.sendto(b"UNSUBSCRIBE\n", (ip, args.udp_port))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="korvo-s31.local", help="设备 IP 或 mDNS 名")
@@ -65,6 +132,8 @@ def main():
     ap.add_argument("--udp-port", type=int, default=9100, help="设备侧 UDP 服务端口")
     ap.add_argument("--local-port", type=int, default=9100, help="本地接收端口（需与设备回推一致，默认同端口）")
     ap.add_argument("--duration", type=int, default=20)
+    ap.add_argument("--scan", action="store_true",
+                    help="扫描模式：常驻接收，每秒把到达率/时延/丢包率回传 /api/scan/report（UDP 扫描行数据源）")
     ap.add_argument("--csv")
     args = ap.parse_args()
 
@@ -77,6 +146,10 @@ def main():
 
     offset = sync_clock(ip, args.http_port)
     print(f"clock offset = {offset/1000:.2f} ms", file=sys.stderr)
+
+    if args.scan:
+        scan_loop(sock, ip, args)
+        return
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)

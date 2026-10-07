@@ -6,6 +6,13 @@ dependencies:
   espressif/esp_video: "2.2.0"
   # ESP32-S31-Korvo-1 板级支持（引脚/LDO/传感器电源封装）
   espressif/esp32_s31_korvo_1: "1.0.1"
+  # USB UVC host 驱动（任务书硬性选型：新一代 usb_host_uvc，禁用 usb_stream）。
+  # esp_video 2.2.0 本身就依赖它（esp32p4/s3/s31 目标，~2.5）；这里显式声明同版本段，
+  # 与 dependencies.lock 已解析的 2.5.2 一致。esp_video 的 UVC Kconfig 保持关闭，
+  # 本工程直接用其原生 API（原因见 README「可行性结论」）。
+  espressif/usb_host_uvc: "~2.5"
+  # USB Host 库（IDF v6 起移入组件仓库；BSP 同样依赖 ^1）
+  espressif/usb: "^1"
   # IDF v6 起 cJSON 与 mDNS 移入组件仓库
   espressif/cjson: "^1.7"
   espressif/mdns: "^1.4"

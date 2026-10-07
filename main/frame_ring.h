@@ -17,16 +17,36 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+/*
+ * 帧级元数据（采集源扩展，U1/U4）：
+ *   source     0=DVP 1=USB（video_source_t，此处用 u8 避免 frame_ring 依赖 source_if）
+ *   scaled     本帧是否由 ESP32 从更大原生分辨率缩放/裁剪得到
+ *   ts_meaning 0=t_capture_us 为传感器输出时刻（DVP）；1=完整帧到达 ESP32 时刻（USB）
+ */
+#define FRAME_SRC_DVP            0
+#define FRAME_SRC_USB            1
+#define FRAME_TS_SENSOR_OUT      0
+#define FRAME_TS_FRAME_ARRIVAL   1
+
+typedef struct {
+    uint8_t source;
+    uint8_t scaled;
+    uint8_t ts_meaning;
+} frame_meta_t;
+
 typedef struct {
     uint8_t  *data;              /* PSRAM，JPEG 数据 */
     size_t    cap;               /* 槽容量 */
     size_t    len;               /* 本帧 JPEG 长度 */
-    uint64_t  t_capture_us;      /* DQBUF 返回时刻（esp_timer） */
-    uint64_t  t_encode_done_us;  /* 编码完成时刻（esp_timer） */
+    uint64_t  t_capture_us;      /* 采集打点：DVP=DQBUF 返回时刻；USB=帧到达时刻（见 ts_meaning） */
+    uint64_t  t_encode_done_us;  /* 编码完成时刻（esp_timer）；直通模式与 t_capture 相同 */
     uint32_t  fid;               /* 递增帧号 */
     uint16_t  w, h;
     uint8_t   quality;
     uint8_t   sensor_fmt_is_uyvy; /* 保留 */
+    uint8_t   source;             /* FRAME_SRC_* */
+    uint8_t   scaled;             /* 原生→输出经 ESP32 缩放 */
+    uint8_t   ts_meaning;         /* FRAME_TS_* */
     int       refcnt;
     bool      active;
     bool      writing;           /* 发布者正在锁外拷贝此槽（消费者跳过） */
@@ -37,9 +57,13 @@ typedef struct frame_ring frame_ring_t;
 frame_ring_t *frame_ring_create(int slots, size_t slot_cap);
 void          frame_ring_destroy(frame_ring_t *r);
 
-/* 写侧：把一帧拷入环；若无空闲槽返回 false（丢帧） */
+/* 写侧：把一帧拷入环；若无空闲槽返回 false（丢帧）。
+ * 原接口保留（默认元数据：DVP 源、未缩放、sensor_out），新代码用 publish_ex。 */
 bool frame_ring_publish(frame_ring_t *r, const uint8_t *jpeg, size_t len,
                         uint64_t t_cap, uint64_t t_enc, uint16_t w, uint16_t h, uint8_t q);
+bool frame_ring_publish_ex(frame_ring_t *r, const uint8_t *jpeg, size_t len,
+                           uint64_t t_cap, uint64_t t_enc, uint16_t w, uint16_t h, uint8_t q,
+                           const frame_meta_t *meta);
 
 /* 读侧：注册/注销（每个客户端一个） */
 void frame_ring_register(frame_ring_t *r, SemaphoreHandle_t notify);  /* notify: 二值信号量 */

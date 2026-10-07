@@ -6,7 +6,7 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "freertos/task.h"
-#include "camera_pipeline.h"
+#include "source_if.h"
 #include "frame_ring.h"
 #include "stream_server.h"
 #include "wifi_net.h"
@@ -69,10 +69,14 @@ static void governor_tick(void)
     if (s_m.bitrate_mbps > s_m.target_mbps * 1.15f) {
         if (++s_gov_overshoot >= 3) {
             s_gov_overshoot = 0;
-            uint8_t q = cam_pipe_info()->quality;
-            if (q > 5) {
+            uint8_t q = src_if_info()->quality;
+            if (src_if_info()->usb_mode == USB_MODE_PASSTHROUGH) {
+                /* 直通模式画质由摄像头固件决定，码率自适应降质不可用（如实记录） */
+                snprintf(s_m.gov_last, sizeof(s_m.gov_last),
+                         "passthrough 模式无法降质（quality 不可控），仅告警");
+            } else if (q > 5) {
                 uint8_t nq = q - 5;
-                if (cam_pipe_apply(0, 0, nq, 0) == ESP_OK) {
+                if (src_if_apply(0, 0, nq, 0) == ESP_OK) {
                     s_m.gov_events++;
                     snprintf(s_m.gov_last, sizeof(s_m.gov_last),
                              "5s码率 %.2f Mbps > 目标 %.2f → 质量 %u→%u",
@@ -94,15 +98,15 @@ static void metrics_task(void *arg)
     uint32_t last_total_sent_frames = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        cam_pipe_stats_t *ps = cam_pipe_stats();
+        src_stats_t *ps = src_if_stats();
         uint64_t now = esp_timer_get_time();
         float sec = (now - last_us) / 1e6f;
         if (sec <= 0) continue;
 
-        uint32_t cap_now = ps->cap_frames, enc_now = ps->enc_frames;
+        uint32_t cap_now = ps->cap_frames, enc_now = ps->out_frames;
         uint32_t sent_frames = stream_server_frames_sent();
         uint32_t bytes_now = stream_server_bytes_sent();
-        uint64_t enc_bytes_now = ps->enc_bytes;
+        uint64_t enc_bytes_now = ps->out_bytes;
         uint32_t d_cap = cap_now - last_cap;
         uint32_t d_enc = enc_now - last_enc;
         uint32_t d_bytes = bytes_now - last_bytes;
@@ -119,8 +123,8 @@ static void metrics_task(void *arg)
         last_total_sent_frames = sent_frames;
         last_us = now;
 
-        s_m.drop_capture = ps->capture_drops;
-        s_m.drop_encode = ps->encode_drops;
+        s_m.drop_capture = ps->cap_drops;
+        s_m.drop_encode = ps->out_drops;
         s_m.free_heap = esp_get_free_heap_size();
         s_m.min_heap = esp_get_minimum_free_heap_size();
         s_m.free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -133,17 +137,18 @@ static void metrics_task(void *arg)
 
         if ((cpu_tick++ & 1) == 0) update_cpu();
 
-        /* 串口 CSV（每秒一行，供脚本抓取）：
-           CSV,<t_us>,cap_fps,enc_fps,send_fps,mbps,jpeg_avg,drop_cap,drop_enc,heap,psram,mode,rssi,res */
+        /* 串口 CSV（每秒一行，供脚本抓取；末尾字段只增不改，旧脚本可继续按序解析）：
+           CSV,<t_us>,cap_fps,out_fps,send_fps,mbps,jpeg_avg,drop_cap,drop_out,heap,psram,mode,rssi,res,source,usb_mode */
         wifi_info_t *w = wifi_net_info();
-        cam_pipe_info_t *ci = cam_pipe_info();
-        printf("CSV,%lld,%.2f,%.2f,%.2f,%.3f,%u,%u,%u,%u,%u,%s,%d,%ux%u\n",
+        src_info_t *ci = src_if_info();
+        printf("CSV,%lld,%.2f,%.2f,%.2f,%.3f,%u,%u,%u,%u,%u,%s,%d,%ux%u,%s,%s\n",
                (long long)now, s_m.cap_fps, s_m.enc_fps, s_m.send_fps,
                s_m.bitrate_mbps, (unsigned)s_m.jpeg_avg_bytes,
                (unsigned)s_m.drop_capture, (unsigned)s_m.drop_encode,
                (unsigned)s_m.free_heap, (unsigned)s_m.free_psram,
                w->mode == WIFI_MODE_STA_M ? "STA" : "AP",
-               w->rssi, ci->w, ci->h);
+               w->rssi, ci->w, ci->h,
+               src_if_source_name(ci->source), src_if_usb_mode_name(ci->usb_mode));
         governor_tick();
     }
 }

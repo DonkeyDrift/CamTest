@@ -246,7 +246,7 @@ dependencies:
       require: private
       version: '>=5.5.3'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32s2
@@ -270,7 +270,7 @@ dependencies:
       - if: target not in ["linux"]
       version: ^1.0.0
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32s2
@@ -320,7 +320,9 @@ direct_dependencies:
 - espressif/esp32_s31_korvo_1
 - espressif/esp_video
 - espressif/mdns
+- espressif/usb
+- espressif/usb_host_uvc
 - idf
-manifest_hash: fdf00ac878166953637b67af4191efaf61f3b009ef0c7c64b063273cea3c5566
+manifest_hash: 5b94d385dc2921f960deefbdd09981c5f52097bb8aeb99399450e414b9524438
 target: esp32s31
 version: 3.0.0

@@ -28,6 +28,15 @@ CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 # ---- esp_video：DVP 摄像头 + 硬件 JPEG 编码器（S31 SOC_JPEG_CODEC_SUPPORTED=1）----
 CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE=y
 CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE=y
+# esp_video 的 USB UVC V4L2 封装保持关闭：USB 走 usb_host_uvc 原生 API（source_usb.c），
+# 避免其断线去初始化缺陷与 usb_host_install 冲突（源码侦察结论见 README 可行性一节）
+# CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE is not set
+
+# ---- USB UVC（usb_host_uvc 2.5.2，热插拔）----
+# 每档离散帧间隔数组长度（部分摄像头列 30/25/20/15/10fps 多档，默认 3 不够）
+CONFIG_UVC_INTERVAL_ARRAY_SIZE=6
+# 枚举成功时打印完整配置描述符（验收要求：串口可见设备能力清单）
+CONFIG_UVC_PRINTF_CONFIGURATION_DESCRIPTOR=y
 
 # ---- 摄像头传感器（运行时自动侦测；两颗都使能，谁在板上用谁）----
 CONFIG_CAMERA_OV3660=y
