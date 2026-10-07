@@ -1,0 +1,64 @@
+menu "CamTest Configuration"
+
+    choice CAMTEST_WIFI_MODE
+        prompt "Wi-Fi 默认模式"
+        default CAMTEST_WIFI_MODE_STA
+        help
+            STA = 连接指定路由器；SoftAP = 板子自开热点（PC 直连）。
+            运行时可通过 /api/config 或网页切换，扫描也可遍历两种模式。
+        config CAMTEST_WIFI_MODE_STA
+            bool "STA（连接路由器）"
+        config CAMTEST_WIFI_MODE_AP
+            bool "SoftAP（板子开热点）"
+    endchoice
+
+    config CAMTEST_WIFI_STA_SSID
+        string "STA 模式 SSID"
+        default "HUAWEI-DKC"
+
+    config CAMTEST_WIFI_STA_PASSWORD
+        string "STA 模式密码"
+        default "dkc@2026"
+
+    config CAMTEST_WIFI_AP_SSID
+        string "SoftAP SSID"
+        default "korvo-s31"
+
+    config CAMTEST_WIFI_AP_PASSWORD
+        string "SoftAP 密码（>=8 位，空则开放）"
+        default "korvo1234"
+
+    config CAMTEST_MDNS_HOSTNAME
+        string "mDNS 主机名"
+        default "korvo-s31"
+
+    config CAMTEST_MAX_STREAM_CLIENTS
+        int "并发流客户端上限（HTTP+WS 合计）"
+        default 4
+        range 1 8
+
+    config CAMTEST_ENABLE_UDP
+        bool "启用 UDP 分片推送（探索时延下限，需 tools/udp_receiver.py）"
+        default y
+
+    config CAMTEST_UDP_PORT
+        int "UDP 服务端口"
+        default 9100
+
+    config CAMTEST_STREAM_PORT
+        int "流服务 TCP 端口（/stream 与 /ws）"
+        default 81
+
+    config CAMTEST_SNTP_ON_START
+        bool "启动即做 SNTP 对时（提供两端系统钟交叉验证，不用于时延计算）"
+        default n
+
+    config CAMTEST_SCAN_WARMUP_MS
+        int "扫描每组 warmup 时长 ms"
+        default 2000
+
+    config CAMTEST_SCAN_SAMPLE_MS
+        int "扫描每组采样时长 ms"
+        default 10000
+
+endmenu

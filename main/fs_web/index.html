@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<!--
+  CamTest Web UI — ESP32-S31-Korvo-1 MJPEG 图传性能闭环测试
+  纯原生 HTML/CSS/JS，单文件离线内嵌于固件（无 CDN / 无 npm 依赖）。
+
+  与固件的接口契约（与 http_server.c / net_stream_server.c 保持一致）：
+    GET  /stream      multipart/x-mixed-replace，每个 part 头携带
+                      X-Frame-Id / X-Capture-Us / X-Encode-Us / X-Jpeg-Len /
+                      X-Sensor / X-Res / X-Quality
+    GET  /api/sync?t_client=<us>   -> {"t_dev_us":<us>,"t_wall_ms":<ms|0>}
+    GET  /api/status               -> JSON 实时状态（见 renderStatus）
+    POST /api/config               -> {"res","quality","fps_limit","transport","overlay","ntp","target_mbps"}
+    GET  /api/scan/start?modes=sta[,ap]&qualities=10,20,30,40
+    GET  /api/scan/stop
+    GET  /api/scan/result -> {"state","idx","total","cur","rows":[...]}
+    GET  /api/scan/csv    -> text/csv 下载
+    POST /api/scan/report          -> 扫描期间浏览器侧指标回传（设备挂到当前行）
+    ws://host:81/ws                -> 二进制帧：36B 小端头 + JPEG 数据（头定义见 parseWsFrame）
+    （UDP 模式：浏览器无法收 UDP，请用 tools/udp_receiver.py）
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CamTest · ESP32-S31 图传性能测试</title>
+<style>
+:root{
+  --bg:#0d1117;--panel:#161b22;--panel2:#1c2330;--line:#2d333b;--txt:#e6edf3;
+  --dim:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149;--mag:#bc8cff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:14px/1.45 -apple-system,"PingFang SC","Microsoft YaHei",Segoe UI,Roboto,sans-serif;padding:10px 14px 30px}
+h1{font-size:17px;font-weight:600}
+a{color:var(--acc);text-decoration:none}
+code{background:#21262d;border-radius:4px;padding:1px 5px;font-size:12px}
+header{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding:6px 0 10px;border-bottom:1px solid var(--line)}
+.badge{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--dim);white-space:nowrap}
+.badge b{color:var(--txt);font-weight:600}
+.badge.ok b{color:var(--ok)}.badge.warn b{color:var(--warn)}.badge.err b{color:var(--err)}
+.grid{display:grid;grid-template-columns:minmax(420px,1.35fr) minmax(330px,1fr);gap:14px;margin-top:12px}
+@media(max-width:960px){.grid{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+.card h2{font-size:13px;font-weight:600;color:var(--dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:.4px}
+#videoWrap{position:relative;background:#000;border-radius:8px;overflow:hidden}
+#video{display:block;width:100%;height:auto;max-height:52vh;object-fit:contain}
+#videoOv{position:absolute;left:8px;top:8px;font:600 12px/1.3 ui-monospace,Menlo,monospace;color:#7ee787;text-shadow:0 1px 2px #000;pointer-events:none}
+#videoOv .r{color:#ffa657}
+#streamHint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:13px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:13px}
+.kv .k{color:var(--dim)}
+.kv .v{text-align:right;font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,monospace}
+.kv .v small{color:var(--dim)}
+.big{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:6px 0 2px}
+.big>div{background:var(--panel2);border-radius:8px;padding:6px 8px;text-align:center}
+.big .n{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,monospace}
+.big .l{font-size:11px;color:var(--dim)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:4px 6px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
+th{color:var(--dim);font-weight:600;position:sticky;top:0;background:var(--panel)}
+.scroll{max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+button{background:#21262d;color:var(--txt);border:1px solid #363b42;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer}
+button:hover{background:#30363d}
+button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
+button.primary:disabled{opacity:.5;cursor:default}
+button.stop{background:#b62324;border-color:#b62324;color:#fff}
+select,input[type=range],input[type=text],input[type=number]{background:#0d1117;color:var(--txt);border:1px solid #363b42;border-radius:6px;padding:4px 6px;font-size:13px}
+label.ctl{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:5px 0;font-size:13px}
+label.ctl .lab{color:var(--dim)}
+#chart{width:100%;height:150px;display:block}
+.note{font-size:12px;color:var(--dim);margin-top:6px}
+.tag{display:inline-block;border-radius:4px;padding:0 5px;font-size:11px;margin-left:4px}
+.tag.est{background:#3b2e12;color:var(--warn)}
+.tag.ms{background:#122a3b;color:var(--acc)}
+#banner{display:none;background:#3d1417;border:1px solid #f85149;border-radius:8px;padding:8px 12px;margin-top:10px;color:#ffd6d6;font-size:13px}
+#scanBar{height:8px;background:var(--panel2);border-radius:4px;overflow:hidden;margin:6px 0}
+#scanBarIn{height:100%;width:0;background:linear-gradient(90deg,#1f6feb,#a371f7);transition:width .5s}
+footer{margin-top:16px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🎥 CamTest <span style="color:var(--dim);font-weight:400">ESP32-S31-Korvo-1 图传性能闭环</span></h1>
+  <span class="badge" id="bSensor">sensor <b>—</b></span>
+  <span class="badge" id="bRes">—</span>
+  <span class="badge" id="bWifi">Wi-Fi <b>—</b></span>
+  <span class="badge" id="bRssi">RSSI <b>—</b></span>
+  <span class="badge" id="bIp"><a id="ipLink" href="/">—</a></span>
+  <span class="badge" id="bClock">clock <b>—</b></span>
+  <span class="badge" id="bUp">up <b>—</b></span>
+</header>
+
+<div id="banner"></div>
+
+<div class="grid">
+  <!-- 左列：画面 + 折线图 + 控制 -->
+  <div>
+    <div class="card">
+      <h2>实时画面 <span id="transportNote" class="tag ms">HTTP MJPEG</span></h2>
+      <div id="videoWrap">
+        <canvas id="video"></canvas>
+        <div id="videoOv"></div>
+        <div id="streamHint">正在连接 /stream …</div>
+      </div>
+      <div class="row2" style="margin-top:8px">
+        <div class="big">
+          <div><div class="n" id="nArrFps">–</div><div class="l">到达 FPS<br>(浏览器实测)</div></div>
+          <div><div class="n" id="nCapFps">–</div><div class="l">采集 FPS<br>(设备侧)</div></div>
+          <div><div class="n" id="nLat">–</div><div class="l">端到端时延 1s均值<br><span style="color:var(--warn)">含估算成分</span></div></div>
+        </div>
+      </div>
+      <canvas id="chart"></canvas>
+      <div class="note">折线：端到端时延 1s 均值（左轴，ms，<span style="color:#ffa657">橙=设备编码耗时(实测)</span>，<span style="color:#58a6ff">蓝=端到端(时钟同步法，网络+浏览器段为估算)</span>）；柱：到达帧率（右轴）。</div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>参数控制（切换会重建采集/编码链路，约 1~2 s）</h2>
+      <div class="row2">
+        <div>
+          <label class="ctl"><span class="lab">分辨率</span><select id="cRes"></select></label>
+          <label class="ctl"><span class="lab">JPEG 质量（<span id="qDir">0~100，越大画质越高、码率越大</span>）</span>
+            <span><input type="range" id="cQ" min="1" max="100" value="20" style="width:110px"> <b id="cQv" style="font-family:ui-monospace">20</b></span></label>
+          <label class="ctl"><span class="lab">帧率上限 (fps)</span><input type="number" id="cFps" min="1" max="60" value="30" style="width:70px"></label>
+        </div>
+        <div>
+          <label class="ctl"><span class="lab">传输模式</span><select id="cTr">
+            <option value="http">HTTP MJPEG (fetch 流解析)</option>
+            <option value="ws">WebSocket 二进制</option>
+            <option value="udp">UDP 分片（需 tools/udp_receiver.py）</option>
+          </select></label>
+          <label class="ctl"><span class="lab">画面叠加设备毫秒计数器（光学校验）</span><input type="checkbox" id="cOv"></label>
+          <label class="ctl"><span class="lab">目标码率上限 Mbps（0=关闭自适应降质）</span><input type="number" id="cBr" min="0" max="50" step="0.5" value="0" style="width:70px"></label>
+        </div>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button class="primary" id="bApply">应用配置</button>
+        <a href="/overlay" target="_blank">光学闭环校验说明 →</a>
+        <span class="note" id="cfgMsg"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右列：指标 -->
+  <div>
+    <div class="card">
+      <h2>时延拆分（ms）</h2>
+      <div class="kv">
+        <span class="k">当前值</span><span class="v" id="lNow">–</span>
+        <span class="k">1 s 均值</span><span class="v" id="l1s">–</span>
+        <span class="k">5 s 均值</span><span class="v" id="l5s">–</span>
+        <span class="k">P95 (5 s)</span><span class="v" id="lP95">–</span>
+        <span class="k">最大 (5 s)</span><span class="v" id="lMax">–</span>
+        <span class="k">抖动 σ (5 s)</span><span class="v" id="lStd">–</span>
+      </div>
+      <div class="note">编码耗时 = <code>t_encode − t_capture</code>（设备侧，精确实测）。网络+浏览器传输 = 端到端 − 编码（<span class="tag est">估算</span>，含时钟同步误差，典型 ±5 ms 以内，见 README 误差分析）。</div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>帧率 / 带宽</h2>
+      <div class="kv">
+        <span class="k">采集 FPS（设备）</span><span class="v" id="fCap">–</span>
+        <span class="k">编码 FPS（设备）</span><span class="v" id="fEnc">–</span>
+        <span class="k">发送 FPS（设备→socket）</span><span class="v" id="fSend">–</span>
+        <span class="k">到达 FPS（浏览器 1s/5s）</span><span class="v" id="fArr">–</span>
+        <span class="k">目标 FPS</span><span class="v" id="fTgt">–</span>
+        <span class="k">单帧均值</span><span class="v" id="bAvg">–</span>
+        <span class="k">瞬时码率</span><span class="v" id="bNow">–</span>
+        <span class="k">5 s 平均码率</span><span class="v" id="b5s">–</span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>设备资源（设备侧实测）</h2>
+      <div class="kv">
+        <span class="k">CPU0 / CPU1 占用</span><span class="v" id="rCpu">–</span>
+        <span class="k">空闲堆 / 最低水位</span><span class="v" id="rHeap">–</span>
+        <span class="k">PSRAM 空闲 / 最低水位</span><span class="v" id="rPs">–</span>
+        <span class="k">采集丢帧 / 编码丢帧</span><span class="v" id="rDrop">–</span>
+        <span class="k">任务栈余量 (capture/enc/http)</span><span class="v" id="rStk">–</span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>并发客户端（设备侧统计）</h2>
+      <div class="scroll" style="max-height:120px"><table id="tClients"><thead><tr><th>类型</th><th>来源</th><th>发送 FPS</th><th>码率</th></tr></thead><tbody><tr><td colspan="4" style="text-align:center;color:var(--dim)">—</td></tr></tbody></table></div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>自动参数扫描（闭环）</h2>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="primary" id="bScan">▶ 开始扫描</button>
+        <button id="bScanStop" disabled>停止</button>
+        <label style="font-size:13px;color:var(--dim)"><input type="checkbox" id="scAp"> 同时扫描 SoftAP 模式（STA→AP 切换时浏览器会断流并自动重连）</label>
+      </div>
+      <div id="scanBar"><div id="scanBarIn"></div></div>
+      <div class="note" id="scanState">状态：空闲。扫描矩阵 = 支持分辨率 × 质量(10/20/30/40) × 网络模式，每组 warmup 2 s + 采样 10 s。</div>
+      <div class="scroll" style="margin-top:8px;max-height:320px">
+        <table id="tScan"><thead><tr>
+          <th>时间</th><th>分辨率</th><th>质量</th><th>模式</th><th>MHz</th><th>RSSI</th>
+          <th>采集fps</th><th>编码fps</th><th>到达fps</th><th>kB/帧</th><th>Mbps</th>
+          <th>时延均值</th><th>P95</th><th>max</th><th>σ</th><th>编码ms</th><th>CPU0/1</th><th>丢帧</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
+      <div style="margin-top:8px"><a href="/api/scan/csv" download="camtest_scan.csv"><button>⬇ 导出 CSV</button></a></div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  指标可信度说明：<b style="color:var(--ok)">设备侧精确实测</b>（采集/编码 FPS、编码耗时、码率、CPU、内存）；
+  <b style="color:var(--acc)">时钟同步法</b>（端到端时延，其中"网络+浏览器"段为<span class="tag est">估算</span>，可被光学闭环校验）；
+  浏览器到达 FPS 为浏览器侧精确实测。设备时间一律采用 <code>esp_timer_get_time()</code> 单调时钟。
+</footer>
+
+<script>
+"use strict";
+/* ============================== 全局状态 ============================== */
+const S = {
+  offsetUs: null,      // 设备时钟 - 浏览器时钟 (us)：t_dev = t_client + offsetUs
+  rttUs: null,
+  wallDiffMs: null,    // 两端系统钟差（NTP 交叉验证用）
+  syncCount: 0,
+  frames: [],          // 每帧样本 {arrive(client us), capUs(dev), encUs(dev), len, fid, w,h,q}
+  secBuckets: [],      // 每秒聚合 {t, lat, enc, fps, bits}
+  lastFid: 0, frameCount: 0,
+  status: null, supportedRes: [],
+  transport: "http", ws: null, wsOpen: false,
+  scanRunning: false,
+  chartData: [],
+};
+const $ = id => document.getElementById(id);
+function fmtB(b){ if(b>=1048576) return (b/1048576).toFixed(2)+" MB"; if(b>=1024) return (b/1024).toFixed(1)+" kB"; return b+" B"; }
+function fmtN(v,d=1){ return (v==null||isNaN(v))?"–":(+v).toFixed(d); }
+function banner(msg){ const b=$("banner"); if(!msg){b.style.display="none";return;} b.style.display="block"; b.textContent=msg; }
+
+/* ============================== 时钟同步 ==============================
+   Christian 算法（NTP 简化版），抗抖动处理：
+   1) 客户端在请求前取 t0（客户端单调钟 performance.now()+timeOrigin，单位 us），
+      收到响应后取 t1；响应体带设备单调钟读数 t_dev（esp_timer，us）。
+      固件在"即将写响应"时刻采样 t_dev，因此 t_dev 对应的客户端时刻 ≈ t0 + rtt/2
+      （假设上下行对称）。
+   2) offset = t_dev − (t0 + rtt/2)。此后任意客户端时刻 tc 的设备钟读数 = tc + offset。
+      端到端时延 = t_arrive(客户端) − (t_capture + offset)，全部换算到同一时钟域相减，
+      offset 的常量误差在相减中抵消，只残留 offset 漂移（30 s 重同步一次，漂移可忽略）。
+   3) rtt 抖动会污染单次估计 → 发 ≥8 次请求，取 rtt 最小的 3 次 offset 的中位数。
+   注：设备用 esp_timer（单调），客户端用 performance 钟也单调，两端均不受 NTP 跳变影响。
+   ====================================================================== */
+async function syncClock(){
+  const probes=[];
+  for(let i=0;i<8;i++){
+    const t0=Math.round((performance.timeOrigin+performance.now())*1000);
+    try{
+      const r=await fetch("/api/sync?t_client="+t0,{cache:"no-store"});
+      const t1=Math.round((performance.timeOrigin+performance.now())*1000);
+      const j=await r.json();
+      if(j.t_dev_us!=null){
+        const rtt=t1-t0;
+        probes.push({rtt, off:j.t_dev_us-(t0+rtt/2)});
+        if(j.t_wall_ms) S.wallDiffMs=j.t_wall_ms-(t1/1000);
+      }
+    }catch(e){}
+    await new Promise(r=>setTimeout(r,60));
+  }
+  if(!probes.length) return;
+  probes.sort((a,b)=>a.rtt-b.rtt);
+  const best=probes.slice(0,3).map(p=>p.off).sort((a,b)=>a-b);
+  S.offsetUs=best[Math.floor(best.length/2)];
+  S.rttUs=probes[0].rtt; S.syncCount++;
+  const b=$("bClock");
+  b.innerHTML=`clock <b>offset ${fmtN(S.offsetUs/1000,1)}ms · rtt ${fmtN(S.rttUs/1000,1)}ms · #${S.syncCount}</b>`;
+  b.className="badge "+(S.rttUs<50000?"ok":S.rttUs<150000?"warn":"err");
+}
+function devUsToClientUs(tDevUs){ return tDevUs - S.offsetUs; } // 设备钟 → 客户端钟
+
+/* ============================== MJPEG 流解析 ==============================
+   不用 <img src=/stream>：浏览器无法获得每帧到达时刻。
+   用 fetch + ReadableStream 手动解析 multipart，在 part 头解析完成瞬间
+   记 t_arrive（客户端钟），结合帧头里的设备侧 t_capture/t_encode 计算时延。
+   ====================================================================== */
+let streamAbort=null;
+async function streamLoop(){
+  if(S.transport!=="http") return;
+  $("streamHint").style.display="flex"; banner(null);
+  while(S.transport==="http"){
+    streamAbort=new AbortController();
+    try{
+      // 流服务固定在 81 端口（与固件 net_stream_server 一致；80 是管理 API）
+      const streamUrl=location.protocol+"//"+location.hostname+":81/stream";
+      const r=await fetch(streamUrl,{signal:streamAbort.signal,cache:"no-store"});
+      if(!r.ok||!r.body) throw new Error("stream http "+r.status);
+      $("streamHint").style.display="none";
+      const rd=r.body.getReader();
+      let buf=new Uint8Array(0), state=0, hdrLen=0, bodyLen=0, meta=null;
+      const enc=new TextDecoder();
+      for(;;){
+        const {done,value}=await rd.read();
+        if(done) break;
+        // 拼接
+        const nb=new Uint8Array(buf.length+value.length); nb.set(buf); nb.set(value,buf.length); buf=nb;
+        let progress=true;
+        while(progress){
+          progress=false;
+          if(state===0){ // 找 boundary 行结束
+            const i=buf.indexOf(13); // \r
+            if(i<0) continue;
+            if(buf[i+1]===10){
+              const line=enc.decode(buf.subarray(0,i));
+              if(!line.includes("frame")&&!line.startsWith("--")){/*首行可能是 boundary*/}
+              buf=buf.subarray(i+2); state=1; progress=true;
+            } else continue; // \r 后不是 \n，等更多数据（理论不发生）
+          }
+          if(state===1){ // 收集头直到 \r\n\r\n
+            for(let k=0;k+3<buf.length;k++){
+              if(buf[k]===13&&buf[k+1]===10&&buf[k+2]===13&&buf[k+3]===10){
+                const htxt=enc.decode(buf.subarray(0,k));
+                hdrLen=k+4;
+                meta={fid:0,cap:0,enc:0,len:0,sensor:"",res:"",q:0};
+                htxt.split("\r\n").forEach(l=>{
+                  const p=l.indexOf(":"); if(p<0)return;
+                  const kn=l.slice(0,p).trim().toLowerCase(), v=l.slice(p+1).trim();
+                  if(kn==="content-length") meta.len=+v;
+                  else if(kn==="x-frame-id") meta.fid=+v;
+                  else if(kn==="x-capture-us") meta.cap=+v;      // Number（<2^53 精确）
+                  else if(kn==="x-encode-us") meta.enc=+v;
+                  else if(kn==="x-jpeg-len") meta.len=+v;
+                  else if(kn==="x-sensor") meta.sensor=v;
+                  else if(kn==="x-res") meta.res=v;
+                  else if(kn==="x-quality") meta.q=+v;
+                });
+                if(!S.sensorName&&meta.sensor){S.sensorName=meta.sensor;}
+                state=2; buf=buf.subarray(hdrLen); progress=true; break;
+              }
+            }
+            if(state!==2) continue;
+          }
+          if(state===2){ // 收 JPEG 体
+            if(buf.length>=meta.len){
+              const jpeg=buf.subarray(0,meta.len);
+              onFrame(meta, jpeg, performance.timeOrigin+performance.now()); // ← 此刻即"首字节解析完成"近似到达时刻
+              buf=buf.subarray(meta.len);
+              if(buf.length>=2&&buf[0]===13&&buf[1]===10) buf=buf.subarray(2);
+              state=0; progress=true;
+            }
+          }
+        }
+      }
+    }catch(e){
+      if(e.name==="AbortError") return; // 主动切换传输模式
+      $("streamHint").textContent="流断开："+e+"，1 s 后重连…"; $("streamHint").style.display="flex";
+      banner("MJPEG 流连接断开，正在自动重连（检查 Wi-Fi / 服务状态）");
+      await new Promise(r=>setTimeout(r,1000));
+    }
+  }
+}
+
+/* ============================== WebSocket 传输 ==============================
+   帧格式（小端）：36 字节头 + JPEG：
+     0  : "MJP1"        4B
+     4  : frame_id      u32
+     8  : t_capture_us  u64
+     16 : t_encode_us   u64
+     24 : width         u16
+     26 : height        u16
+     28 : quality       u8
+     29 : reserved      u8
+     30 : jpeg_len      u32
+     34 : reserved      u16  → 共 36B
+   ====================================================================== */
+function wsLoop(){
+  if(S.ws){ try{S.ws.close();}catch(e){} }
+  if(S.transport!=="ws") return;
+  const host=location.hostname||"korvo-s31.local";
+  const ws=new WebSocket("ws://"+host+":81/ws");
+  S.ws=ws;
+  ws.binaryType="arraybuffer";
+  ws.onopen=()=>{ $("streamHint").style.display="none"; banner(null); };
+  ws.onmessage=ev=>{
+    if(!(ev.data instanceof ArrayBuffer)) return;
+    const dv=new DataView(ev.data);
+    if(dv.getUint32(0,true)!==0x31504A4D){ return; } // "MJP1" 小端
+    const fid=dv.getUint32(4,true);
+    const cap=Number(dv.getBigUint64(8,true)), enc=Number(dv.getBigUint64(16,true));
+    const w=dv.getUint16(24,true), h=dv.getUint16(26,true);
+    const q=dv.getUint8(28);
+    const len=dv.getUint32(30,true);
+    onFrame({fid,cap,enc,len,q,sensor:S.sensorName||"",res:w+"x"+h}, new Uint8Array(ev.data,36,len), performance.timeOrigin+performance.now());
+  };
+  ws.onclose=()=>{ if(S.transport==="ws"){ $("streamHint").textContent="WS 断开，1 s 后重连…";$("streamHint").style.display="flex"; setTimeout(wsLoop,1000);} };
+  ws.onerror=()=>{ try{ws.close();}catch(e){} };
+}
+
+/* ============================== 帧处理与统计 ============================== */
+const bmpFallback=window.createImageBitmap?null:true;
+let drawing=false;
+async function onFrame(meta, jpeg, arriveMs){
+  if(S.offsetUs==null) return; // 未同步前不统计时延（仍显示画面）
+  const arriveUs=Math.round(arriveMs*1000);
+  // 注意：设备时间戳全部用 Number（esp_timer 开机微秒 < 2^53，整数精确；勿用 BigInt 混算）
+  // offset = t_dev − (t0+rtt/2) = 设备钟 − 客户端钟；
+  // 端到端 = 客户端到达 − 设备采集 + offset（两端换算后相减，推导见 README）
+  const latUs=arriveUs - meta.cap + S.offsetUs;
+  const encUs=meta.enc - meta.cap;                 // 设备侧编码耗时（精确）
+  S.frames.push({arrive:arriveUs, lat:latUs, enc:encUs, len:meta.len, fid:meta.fid});
+  if(S.frames.length>3000) S.frames.splice(0,1000);
+  S.lastFid=meta.fid; S.frameCount++;
+  // 显示（canvas）
+  if(!drawing){
+    drawing=true;
+    try{
+      const blob=new Blob([jpeg],{type:"image/jpeg"});
+      const bmp=await createImageBitmap(blob);
+      const cv=$("video");
+      if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height;}
+      cv.getContext("2d").drawImage(bmp,0,0);
+      bmp.close();
+      $("videoOv").innerHTML=`<span class="r">${meta.res} q${meta.q}</span> #${meta.fid} ${fmtB(meta.len)}`+
+        (S.offsetUs!=null?`<br>e2e≈${fmtN(latUs/1000,1)}ms enc=${fmtN(encUs/1000,1)}ms`:"");
+    }catch(e){}
+    drawing=false;
+  }
+}
+
+/* 每秒把窗口聚合到 secBuckets，供折线图与 5s 统计 */
+function bucketSecond(){
+  const now=performance.timeOrigin+performance.now();
+  const win=S.frames.filter(f=>f.arrive>= (now-1000)*1000);
+  const b={t:now, fps:win.length, lat:0, enc:0, bits:0};
+  if(win.length){ win.forEach(f=>{b.lat+=f.lat;b.enc+=f.enc;b.bits+=f.len*8;});
+    b.lat/=win.length; b.enc/=win.length; }
+  S.secBuckets.push(b);
+  if(S.secBuckets.length>90) S.secBuckets.shift();
+}
+
+function pct(arr,p){ if(!arr.length)return null; const a=[...arr].sort((x,y)=>x-y); return a[Math.min(a.length-1,Math.floor(p*a.length))]; }
+function mean(a){ return a.length?a.reduce((s,v)=>s+v,0)/a.length:null; }
+function std(a){ if(a.length<2)return null; const m=mean(a); return Math.sqrt(a.reduce((s,v)=>s+(v-m)**2,0)/(a.length-1)); }
+
+function renderLocal(){
+  const now=(performance.timeOrigin+performance.now())*1000; // us
+  const w1=S.frames.filter(f=>f.arrive>=now-1e6), w5=S.frames.filter(f=>f.arrive>=now-5e6);
+  const lat1=w1.map(f=>f.lat/1000), lat5=w5.map(f=>f.lat/1000);
+  $("nArrFps").textContent=w1.length;
+  $("nLat").textContent=fmtN(mean(lat1),1);
+  $("lNow").textContent=lat1.length?fmtN(lat1[lat1.length-1],1):"–";
+  $("l1s").textContent=fmtN(mean(lat1),1);
+  $("l5s").textContent=fmtN(mean(lat5),1);
+  $("lP95").textContent=fmtN(pct(lat5,.95),1);
+  $("lMax").textContent=fmtN(lat5.length?Math.max(...lat5):null,1);
+  $("lStd").textContent=fmtN(std(lat5),1);
+  const bits5=w5.reduce((s,f)=>s+f.len*8,0);
+  $("b5s").textContent=(bits5/5/1e6).toFixed(2)+" Mbps";
+  $("fArr").textContent=w1.length+" / "+fmtN(w5.length/5,1);
+  drawChart();
+}
+
+/* ============================== 折线图（原生 canvas 自绘） ============================== */
+function drawChart(){
+  const cv=$("chart"), dpr=window.devicePixelRatio||1;
+  const W=cv.clientWidth||600, H=150;
+  if(cv.width!==W*dpr){cv.width=W*dpr;cv.height=H*dpr;}
+  const g=cv.getContext("2d"); g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,W,H);
+  const data=S.secBuckets.slice(-60);
+  if(data.length<2){g.fillStyle="#8b949e";g.fillText("等待数据…",10,20);return;}
+  const maxLat=Math.max(30,...data.map(d=>d.lat/1000))*1.15;
+  const maxFps=Math.max(5,...data.map(d=>d.fps))*1.15;
+  const pad={l:34,r:30,t:8,b:16};
+  const X=i=>pad.l+(W-pad.l-pad.r)*i/(data.length-1);
+  const Yl=v=>H-pad.b-(H-pad.t-pad.b)*v/maxLat;
+  const Yf=v=>H-pad.b-(H-pad.t-pad.b)*v/maxFps;
+  // 网格
+  g.strokeStyle="#21262d";g.fillStyle="#8b949e";g.font="10px sans-serif";g.lineWidth=1;
+  for(let i=0;i<=3;i++){const v=maxLat*i/3; g.beginPath();g.moveTo(pad.l,Yl(v));g.lineTo(W-pad.r,Yl(v));g.stroke(); g.fillText(v.toFixed(0),2,Yl(v)+3);}
+  g.fillText("ms",2,10);
+  // e2e 线
+  g.strokeStyle="#58a6ff";g.lineWidth=1.6;g.beginPath();
+  data.forEach((d,i)=>{const y=Yl(d.lat/1000); i?g.lineTo(X(i),y):g.moveTo(X(i),y);}); g.stroke();
+  // enc 线
+  g.strokeStyle="#ffa657";g.lineWidth=1.2;g.beginPath();
+  data.forEach((d,i)=>{const y=Yl(d.enc/1000); i?g.lineTo(X(i),y):g.moveTo(X(i),y);}); g.stroke();
+  // fps 柱
+  g.fillStyle="#2ea04355";
+  const bw=Math.max(1,(W-pad.l-pad.r)/data.length*0.5);
+  data.forEach((d,i)=>{ g.fillRect(X(i)-bw/2, Yf(d.fps), bw, H-pad.b-Yf(d.fps)); });
+  g.fillStyle="#3fb950"; g.fillText("fps→",W-pad.r+2,10);
+}
+
+/* ============================== /api/status 轮询 ============================== */
+async function pollStatus(){
+  try{
+    const r=await fetch("/api/status",{cache:"no-store"});
+    S.status=await r.json();
+    renderStatus();
+  }catch(e){ banner("无法获取设备状态（/api/status）："+e); }
+}
+function renderStatus(){
+  const d=S.status; if(!d) return;
+  const dev=d.device||{}, wf=dev.wifi||{}, sc=d.scan||{};
+  banner(null);
+  $("bSensor").innerHTML="sensor <b>"+(dev.sensor||"?")+"</b>";
+  $("bRes").innerHTML=`<b>${dev.res||"?"}</b> · ${dev.fmt||""} · q${dev.quality??"?"}`;
+  $("bWifi").innerHTML=`Wi-Fi <b>${wf.mode||"?"} ${wf.phy||""} ch${wf.channel??"?"} ${wf.band_mhz??"?"}MHz</b>`;
+  $("bRssi").innerHTML=`RSSI <b>${wf.rssi!=null?wf.rssi+" dBm":"—(AP)"}</b>`;
+  $("bRssi").className="badge "+(wf.rssi>-60?"ok":wf.rssi>-72?"warn":"err");
+  $("ipLink").textContent=dev.ip||"—"; $("ipLink").href="http://"+(dev.ip||"");
+  $("bUp").innerHTML="up <b>"+Math.floor((dev.uptime_s||0)/60)+"m"+Math.floor((dev.uptime_s||0)%60)+"s</b>";
+  // 帧率
+  $("nCapFps").textContent=fmtN(dev.fps&&dev.fps.capture);
+  $("fCap").textContent=fmtN(dev.fps&&dev.fps.capture,2);
+  $("fEnc").textContent=fmtN(dev.fps&&dev.fps.encode,2);
+  $("fSend").textContent=fmtN(dev.fps&&dev.fps.send,2);
+  $("fTgt").textContent=fmtN(dev.fps_limit,0);
+  $("bAvg").textContent=dev.jpeg_avg_bytes?fmtB(dev.jpeg_avg_bytes)+" ("+(dev.jpeg_avg_bytes/1024).toFixed(1)+"kB)":"–";
+  $("bNow").textContent=fmtN(dev.bitrate_mbps,2)+" Mbps";
+  // 资源
+  $("rCpu").textContent=fmtN(dev.cpu0,0)+"% / "+fmtN(dev.cpu1,0)+"%";
+  $("rHeap").textContent=fmtB(dev.free_heap||0)+" / "+fmtB(dev.min_heap||0);
+  $("rPs").textContent=fmtB(dev.free_psram||0)+" / "+fmtB(dev.min_psram||0);
+  $("rDrop").textContent=(dev.drop_capture||0)+" / "+(dev.drop_encode||0);
+  $("rStk").textContent=(dev.stack||[]).map(s=>s).join(" / ")||"–";
+  // 客户端
+  const cl=dev.clients||[];
+  const tb=$("tClients").querySelector("tbody");
+  tb.innerHTML=cl.length?cl.map(c=>`<tr><td>${c.type}</td><td>${c.ip}</td><td>${fmtN(c.fps,1)}</td><td>${fmtN(c.mbps,2)}Mbps</td></tr>`).join("")
+    :"<tr><td colspan=4 style='text-align:center;color:var(--dim)'>—</td></tr>";
+  // 控件同步
+  if(!scanActive()) {
+    if(dev.res && !$("cRes").dataset.editing){ const o=[...$("cRes").options].find(o=>o.value===dev.res); if(o)$("cRes").value=dev.res; }
+    if(dev.quality!=null && !$("cQ").matches(":active")){ $("cQ").value=dev.quality; $("cQv").textContent=dev.quality; }
+  }
+  // 扫描
+  renderScan(sc);
+}
+
+/* ============================== 配置 ============================== */
+async function applyConfig(){
+  const body={};
+  body.res=$("cRes").value;
+  body.quality=+$("cQ").value;
+  body.fps_limit=+$("cFps").value;
+  body.transport=$("cTr").value;
+  body.overlay=$("cOv").checked;
+  body.target_mbps=+$("cBr").value;
+  $("cfgMsg").textContent="应用中…";
+  try{
+    const r=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json();
+    $("cfgMsg").textContent=j.ok?"已应用"+(j.restarted?"（链路已重建）":""):"失败："+(j.error||r.status);
+    $("cfgMsg").style.color=j.ok?"var(--ok)":"var(--err)";
+    if(j.ok&&j.transport!==S.transport){ S.transport=j.transport||body.transport; switchTransport(); }
+  }catch(e){ $("cfgMsg").textContent="请求失败："+e; $("cfgMsg").style.color="var(--err)"; }
+}
+function switchTransport(){
+  if(streamAbort){ try{streamAbort.abort();}catch(e){} }
+  if(S.ws){ try{S.ws.close();}catch(e){} S.ws=null; }
+  $("transportNote").textContent=S.transport==="http"?"HTTP MJPEG":S.transport==="ws"?"WebSocket 二进制":"UDP 分片(需外部脚本)";
+  S.frames.length=0;
+  if(S.transport==="http") streamLoop();
+  else if(S.transport==="ws") wsLoop();
+  else { $("streamHint").textContent="UDP 模式请在 PC 上运行 tools/udp_receiver.py（浏览器无法收 UDP）"; $("streamHint").style.display="flex"; }
+}
+
+/* ============================== 扫描 ============================== */
+function scanActive(){ return S.scanRunning; }
+async function startScan(){
+  const modes=$("scAp").checked?"sta,ap":"";
+  const url="/api/scan/start"+(modes?"?modes="+modes:"");
+  try{ const r=await fetch(url); const j=await r.json(); if(!j.ok) throw new Error(j.error||r.status); S.scanRunning=true; $("bScanStop").disabled=false; }
+  catch(e){ banner("启动扫描失败："+e); }
+}
+async function stopScan(){ try{ await fetch("/api/scan/stop"); }catch(e){} }
+function renderScan(sc){
+  const st=sc.state||"idle";
+  if(st==="running"){ S.scanRunning=true; $("bScanStop").disabled=false; }
+  else { if(st==="done"||st==="idle") S.scanRunning=false; $("bScanStop").disabled=true; }
+  const cur=sc.cur||{};
+  $("scanState").innerHTML=st==="running"
+    ? `状态：<b style="color:var(--warn)">扫描中</b> — 第 ${sc.idx+1}/${sc.total} 组：${cur.res} q${cur.q} ${cur.mode}（${sc.phase==="warmup"?"预热中":"采样中"}）`
+    : st==="done" ? "状态：<b style='color:var(--ok)'>完成</b>，共 "+sc.total+" 组。可导出 CSV。"
+    : "状态：空闲";
+  $("scanBarIn").style.width=(sc.total?100*(sc.idx+1)/sc.total:0)+"%";
+  const rows=sc.rows||[];
+  $("tScan").querySelector("tbody").innerHTML=rows.map(r=>`<tr>
+    <td>${r.timestamp}</td><td>${r.resolution}</td><td>${r.quality}</td><td>${r.wifi_mode}</td><td>${r.bandwidth_mhz??"-"}</td><td>${r.rssi??"-"}</td>
+    <td>${fmtN(r.capture_fps,1)}</td><td>${fmtN(r.encode_fps,1)}</td><td>${fmtN(r.arrival_fps,1)}</td>
+    <td>${r.jpeg_avg_bytes?(r.jpeg_avg_bytes/1024).toFixed(1):"-"}</td><td>${fmtN(r.bitrate_mbps,2)}</td>
+    <td>${fmtN(r.latency_mean_ms,1)}</td><td>${fmtN(r.latency_p95_ms,1)}</td><td>${fmtN(r.latency_max_ms,1)}</td><td>${fmtN(r.latency_std_ms,1)}</td>
+    <td>${fmtN(r.encode_ms,1)}</td><td>${r.cpu0_pct!=null?fmtN(r.cpu0_pct,0)+"/"+fmtN(r.cpu1_pct,0):"-"}</td><td>${r.drop_frames??"-"}</td>
+  </tr>`).join("");
+}
+
+/* 扫描期间每秒回传浏览器侧统计，供设备挂到当前组 */
+async function reportIfScanning(){
+  if(!scanActive()) return;
+  const now=(performance.timeOrigin+performance.now())*1000;
+  const w=S.frames.filter(f=>f.arrive>=now-1e6);
+  if(w.length<2) return;
+  const lat=w.map(f=>f.lat/1000);
+  const dev=S.status&&S.status.device||{};
+  const tag=(dev.res||"?")+"@q"+(dev.quality??"?")+"/"+((dev.wifi&&dev.wifi.mode)||"?");
+  const p95=pct(lat,.95), mx=Math.max(...lat);
+  try{
+    await fetch("/api/scan/report",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({tag,arrival_fps:w.length,bitrate_mbps:w.reduce((s,f)=>s+f.len*8,0)/1e6,
+        latency_mean_ms:mean(lat),latency_p95_ms:p95,latency_max_ms:mx,latency_std_ms:std(lat),
+        sample_us:Math.round(w[0].arrive)})});
+  }catch(e){}
+}
+
+/* ============================== 初始化 ============================== */
+async function init(){
+  await syncClock();
+  await pollStatus();
+  const d=S.status&&S.status.device||{};
+  // 分辨率下拉：设备报告的支持列表
+  const sup=(S.status&&S.status.supported_res)||["160x120","320x240","480x320","640x480","800x600","1280x720"];
+  $("cRes").innerHTML=sup.map(r=>`<option value="${r}">${r}</option>`).join("");
+  if(d.res)$("cRes").value=d.res;
+  if(d.quality)$("cQ").value=d.quality,$("cQv").textContent=d.quality;
+  if(d.fps_limit)$("cFps").value=d.fps_limit;
+  if(d.overlay)$("cOv").checked=true;
+  if(d.target_mbps)$("cBr").value=d.target_mbps;
+  $("qDir").textContent=d.quality_desc||"0~100，越大画质越高、码率越大";
+  streamLoop();
+  setInterval(()=>syncClock(),30000);
+  setInterval(pollStatus,500);
+  setInterval(()=>{bucketSecond();renderLocal();},1000);
+  setInterval(reportIfScanning,1000);
+  $("bApply").onclick=applyConfig;
+  $("cQ").oninput=e=>$("cQv").textContent=e.target.value;
+  $("cTr").onchange=e=>{S.transport=e.target.value;switchTransport();};
+  $("bScan").onclick=startScan;
+  $("bScanStop").onclick=stopScan;
+  $("cRes").onfocus=e=>e.target.dataset.editing=1;
+  $("cRes").onchange=e=>delete e.target.dataset.editing;
+}
+init();
+</script>
+</body>
+</html>

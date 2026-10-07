@@ -1,0 +1,12 @@
+## 组件依赖（由 ESP Component Manager 在 idf.py reconfigure/build 时解析下载）
+dependencies:
+  # S31 硬件 JPEG 编码 + V4L2 摄像头框架。
+  # 注：BSP 1.0.1 固定依赖 esp_video ~2.2（<2.3.0），故锁定 2.2.0（官方声明支持 esp32s31，
+  # 与 BSP display_camera_video 示例同源）。registry API 的 2.5.0 在存储索引中尚未可用。
+  espressif/esp_video: "2.2.0"
+  # ESP32-S31-Korvo-1 板级支持（引脚/LDO/传感器电源封装）
+  espressif/esp32_s31_korvo_1: "1.0.1"
+  # IDF v6 起 cJSON 与 mDNS 移入组件仓库
+  espressif/cjson: "^1.7"
+  espressif/mdns: "^1.4"
+  idf: ">=6.1"
