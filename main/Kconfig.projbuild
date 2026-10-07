@@ -53,6 +53,26 @@ menu "CamTest Configuration"
         bool "启动即做 SNTP 对时（提供两端系统钟交叉验证，不用于时延计算）"
         default n
 
+    choice CAMTEST_OV3660_HIFPS
+        prompt "OV3660 高帧率档（160x120/240x240 生效；数据驱动自官方 JPEG30fps 时钟树）"
+        default CAMTEST_OV3660_HIFPS_L2
+        help
+            原理：移植 esp_cam_sensor 2.4.x 官方 JPEG30fps 档的时钟树(0x303b/0x303d/0x3824)
+            到 YUYV 模式（实测 25→31fps），再中心裁剪垂直读出窗口提帧率。
+            代价：垂直视场变小 + 画面纵向拉伸（数字变焦），拉伸倍数见各档说明。
+            实测（2026-10-07 本机）：OFF=25fps / L1=31fps / L2=59fps / L3=71fps / L4=87fps。
+        config CAMTEST_OV3660_HIFPS_OFF
+            bool "关闭（原生 25fps，全视场无拉伸）"
+        config CAMTEST_OV3660_HIFPS_L1
+            bool "L1: ~31fps（全视场，无拉伸）"
+        config CAMTEST_OV3660_HIFPS_L2
+            bool "L2: ~59fps（垂直视场 52%，纵向拉伸 ×1.9）"
+        config CAMTEST_OV3660_HIFPS_L3
+            bool "L3: ~71fps（垂直视场 41%，纵向拉伸 ×2.5）"
+        config CAMTEST_OV3660_HIFPS_L4
+            bool "L4: ~87fps（垂直视场 33%，纵向拉伸 ×3.1）"
+    endchoice
+
     config CAMTEST_SCAN_WARMUP_MS
         int "扫描每组 warmup 时长 ms"
         default 2000

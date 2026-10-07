@@ -121,9 +121,16 @@ footer{margin-top:16px;color:var(--dim);font-size:12px;border-top:1px solid var(
           <label class="ctl"><span class="lab">分辨率</span><select id="cRes"></select></label>
           <label class="ctl"><span class="lab">JPEG 质量（<span id="qDir">0~100，越大画质越高、码率越大</span>）</span>
             <span><input type="range" id="cQ" min="1" max="100" value="20" style="width:110px"> <b id="cQv" style="font-family:ui-monospace">20</b></span></label>
-          <label class="ctl"><span class="lab">帧率上限 (fps)</span><input type="number" id="cFps" min="1" max="60" value="30" style="width:70px"></label>
+          <label class="ctl"><span class="lab">帧率上限 fps（0=不限）</span><input type="number" id="cFps" min="0" max="120" value="0" style="width:70px"></label>
         </div>
         <div>
+          <label class="ctl"><span class="lab">高帧率档（160x120 提速，代价=垂直视场↓+纵向拉伸）</span><select id="cHfp">
+            <option value="0">关（原生25fps 全视场）</option>
+            <option value="1">L1 ~31fps（全视场）</option>
+            <option value="2" selected>L2 ~60fps（V52% 拉伸×1.9）</option>
+            <option value="3">L3 ~75fps（V41% 拉伸×2.5）</option>
+            <option value="4">L4 ~93fps（V33% 拉伸×3.1）</option>
+          </select></label>
           <label class="ctl"><span class="lab">传输模式</span><select id="cTr">
             <option value="http">HTTP MJPEG (fetch 流解析)</option>
             <option value="ws">WebSocket 二进制</option>
@@ -539,6 +546,7 @@ async function applyConfig(){
   body.res=$("cRes").value;
   body.quality=+$("cQ").value;
   body.fps_limit=+$("cFps").value;
+  body.hifps=+$("cHfp").value;
   body.transport=$("cTr").value;
   body.overlay=$("cOv").checked;
   body.target_mbps=+$("cBr").value;
@@ -620,6 +628,7 @@ async function init(){
   if(d.quality)$("cQ").value=d.quality,$("cQv").textContent=d.quality;
   if(d.fps_limit)$("cFps").value=d.fps_limit;
   if(d.overlay)$("cOv").checked=true;
+  if(d.hifps!=null)$("cHfp").value=d.hifps;
   if(d.target_mbps)$("cBr").value=d.target_mbps;
   $("qDir").textContent=d.quality_desc||"0~100，越大画质越高、码率越大";
   streamLoop();

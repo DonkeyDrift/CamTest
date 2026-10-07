@@ -117,7 +117,7 @@ static esp_err_t h_status(httpd_req_t *req)
         "\"drop_capture\":%u,\"drop_encode\":%u,"
         "\"stack\":[%d,%d],"
         "\"uptime_s\":%u,"
-        "\"overlay\":%s,\"target_mbps\":%.1f,\"gov_last\":\"%s\","
+        "\"overlay\":%s,\"target_mbps\":%.1f,\"gov_last\":\"%s\",\"hifps\":%d,"
         "\"wifi\":{\"mode\":\"%s\",\"phy\":\"%s\",\"channel\":%d,\"band_mhz\":%d,\"rssi\":%d,\"ssid\":\"%s\"},"
         "\"ip\":\"%s\",\"mdns\":\"%s.local\","
         "\"clients\":[%s],"
@@ -130,7 +130,7 @@ static esp_err_t h_status(httpd_req_t *req)
         (unsigned)m->free_psram, (unsigned)m->min_psram,
         (unsigned)m->drop_capture, (unsigned)m->drop_encode,
         m->stack_cap, m->stack_enc, (unsigned)m->uptime_s,
-        cam_pipe_overlay() ? "true" : "false", m->target_mbps, m->gov_last,
+        cam_pipe_overlay() ? "true" : "false", m->target_mbps, m->gov_last, cam_boost_level(),
         w->mode == WIFI_MODE_STA_M ? "STA" : "AP", w->phy, w->channel, w->band_mhz,
         w->rssi, w->ssid, w->ip, CONFIG_CAMTEST_MDNS_HOSTNAME, clients,
         esp_get_idf_version());
@@ -204,6 +204,9 @@ static esp_err_t h_config(httpd_req_t *req)
     const cJSON *fps = cJSON_GetObjectItem(j, "fps_limit");
     const cJSON *ov = cJSON_GetObjectItem(j, "overlay");
     const cJSON *br = cJSON_GetObjectItem(j, "target_mbps");
+    const cJSON *vts = cJSON_GetObjectItem(j, "vts");     /* 兼容：仅 VTS（诊断用） */
+    const cJSON *bst = cJSON_GetObjectItem(j, "boost");   /* OV3660 高帧率窗口裁剪 */
+    const cJSON *hfp = cJSON_GetObjectItem(j, "hifps");   /* 0-4 档位（推荐入口） */
 
     bool ok = true;
     if (ov && cJSON_IsBool(ov)) cam_pipe_set_overlay(cJSON_IsTrue(ov));
@@ -213,6 +216,7 @@ static esp_err_t h_config(httpd_req_t *req)
     int w = 0, h = 0;
     uint8_t quality = 0;
     int fps_limit = 0;
+    int vts_val = (vts && cJSON_IsNumber(vts)) ? vts->valueint : -1;
     if (res && cJSON_IsString(res) && strchr(res->valuestring, 'x')) {
         sscanf(res->valuestring, "%dx%d", &w, &h);
         need_rebuild = cam_pipe_res_supported(w, h);
@@ -222,8 +226,27 @@ static esp_err_t h_config(httpd_req_t *req)
     if (fps && cJSON_IsNumber(fps) && fps->valueint > 0) fps_limit = fps->valueint;
 
     esp_err_t err = ESP_OK;
-    if (need_rebuild && ok) {
-        err = cam_pipe_apply(w, h, quality, fps_limit);
+    if (hfp && cJSON_IsNumber(hfp) && ok) {
+        cam_boost_apply_level(hfp->valueint);
+        if (!w) { w = 160; h = 120; }   /* 高帧率档默认目标 160x120 */
+        need_rebuild = true;
+    }
+    if (bst && cJSON_IsObject(bst) && ok) {
+        cam_boost_params_t bp = {0};
+        const cJSON *f;
+        if ((f = cJSON_GetObjectItem(bst, "vts")) && cJSON_IsNumber(f)) bp.vts = f->valueint;
+        if ((f = cJSON_GetObjectItem(bst, "hts")) && cJSON_IsNumber(f)) bp.hts = f->valueint;
+        if ((f = cJSON_GetObjectItem(bst, "vstart")) && cJSON_IsNumber(f)) bp.vstart = f->valueint;
+        if ((f = cJSON_GetObjectItem(bst, "vend")) && cJSON_IsNumber(f)) bp.vend = f->valueint;
+        if ((f = cJSON_GetObjectItem(bst, "hstart")) && cJSON_IsNumber(f)) bp.hstart = f->valueint;
+        if ((f = cJSON_GetObjectItem(bst, "hend")) && cJSON_IsNumber(f)) bp.hend = f->valueint;
+        if ((f = cJSON_GetObjectItem(bst, "c303b")) && cJSON_IsNumber(f)) cam_boost_clk_set(f->valueint, -1, -1);
+        if ((f = cJSON_GetObjectItem(bst, "c303d")) && cJSON_IsNumber(f)) cam_boost_clk_set(-1, f->valueint, -1);
+        if ((f = cJSON_GetObjectItem(bst, "c3824")) && cJSON_IsNumber(f)) cam_boost_clk_set(-1, -1, f->valueint);
+        if (!w) { w = 240; h = 240; }   /* boost 基于母本档，未指定 res 时默认 240x240 */
+        err = cam_pipe_apply_boost(w, h, quality, fps_limit, bp.vts ? &bp : NULL);
+    } else if ((need_rebuild || vts_val >= 0) && ok) {
+        err = cam_pipe_apply_vts(w, h, quality, fps_limit, vts_val > 0 ? vts_val : 0);
     } else if (fps_limit) {
         cam_pipe_set_fps_limit(fps_limit);   /* 轻量：不重建 */
     } else if (quality) {

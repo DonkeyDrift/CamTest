@@ -35,8 +35,21 @@ typedef struct {
 esp_err_t cam_pipe_init(void);                       /* 含 BSP 摄像头上电 + 传感器侦测 */
 void      cam_pipe_start(void);                      /* 启动采集/编码任务 */
 esp_err_t cam_pipe_apply(int w, int h, uint8_t quality, int fps_limit);  /* 重建链路（可在线调用） */
+esp_err_t cam_pipe_apply_vts(int w, int h, uint8_t quality, int fps_limit, int vts);  /* 兼容入口 */
+
+/* OV3660 高帧率实验：窗口裁剪 + 时序改写（全 0 = 恢复原生表；推导见 camera_pipeline.c） */
+typedef struct {
+    int vts, hts, vstart, vend, hstart, hend;
+} cam_boost_params_t;
+esp_err_t cam_pipe_apply_boost(int w, int h, uint8_t quality, int fps_limit,
+                               const cam_boost_params_t *bp);
+void cam_boost_clk_set(int c303b, int c303d, int c3824);   /* 实验台：时钟树补丁（-1=不变） */
+void cam_boost_apply_level(int level);                    /* 0=off, 1..4 实测标定档 */
+int  cam_boost_level(void);
 esp_err_t cam_pipe_set_quality(uint8_t quality);     /* 轻量：在线改 JPEG 质量，不重建链路 */
 void      cam_pipe_set_fps_limit(int fps);           /* 轻量：在线改软件帧率上限 */
+void      cam_pipe_stop(void);                       /* 完全停流（采集源切换用）：任务停靠 + STREAMOFF + 关 fd；帧环/队列保留 */
+bool      cam_pipe_scaled(int *native_w, int *native_h);  /* 当前输出是否经抽取/裁剪得到，是则带出原生分辨率 */
 
 frame_ring_t     *cam_pipe_ring(void);
 cam_pipe_info_t  *cam_pipe_info(void);

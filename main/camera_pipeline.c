@@ -41,6 +41,18 @@
 
 static const char *TAG = "cam_pipe";
 
+#if CONFIG_CAMTEST_OV3660_HIFPS_L4
+#define CAMTEST_OV3660_HIFPS_LEVEL 4
+#elif CONFIG_CAMTEST_OV3660_HIFPS_L3
+#define CAMTEST_OV3660_HIFPS_LEVEL 3
+#elif CONFIG_CAMTEST_OV3660_HIFPS_L2
+#define CAMTEST_OV3660_HIFPS_LEVEL 2
+#elif CONFIG_CAMTEST_OV3660_HIFPS_L1
+#define CAMTEST_OV3660_HIFPS_LEVEL 1
+#else
+#define CAMTEST_OV3660_HIFPS_LEVEL 0
+#endif
+
 #define CAM_DEV        ESP_VIDEO_DVP_DEVICE_NAME   /* /dev/video2 */
 #define JPEG_DEV       ESP_VIDEO_JPEG_DEVICE_NAME  /* /dev/video10 */
 #define CAM_BUFS       3
@@ -62,6 +74,14 @@ typedef struct {
     int src_w, src_h;                          /* 原生采集分辨率 */
     int tgt_w, tgt_h;                          /* 目标输出分辨率（虚拟档可小于原生） */
     struct { int kx, ky, x0, y0; } dsc;        /* 原生→目标映射：整数抽取(kx,ky) + 中心裁剪起点(x0,y0) */
+    /* OV3660 高帧率实验档：克隆 240x240 YUYV 寄存器表并改写 VTS(0x380e/f)。
+     * 帧率 ≈ PCLK/(HTS*VTS)，实测 25fps@VTS783 → 线性外推 VTS320≈61fps。
+     * set_format 会保留格式指针，故必须静态存储。 */
+    const esp_cam_sensor_format_t *small_yuv_fmt;   /* 240x240 YUYV 原生档（克隆母本） */
+    esp_cam_sensor_format_t boost_fmt;              /* 合成高帧率档（静态） */
+    bool boost_valid;
+    int  vts_override;                              /* 0=用原生表；>0=VTS 改写值 */
+    int  boost_level;                               /* 0=off, 1..4 档位 */
 
     /* DVP 采集缓冲（mmap） */
     struct {
@@ -190,6 +210,116 @@ static bool is_yuv(esp_cam_sensor_output_format_t f)
     return f == ESP_CAM_SENSOR_PIXFORMAT_YUV422_UYVY || f == ESP_CAM_SENSOR_PIXFORMAT_YUV422_YUYV;
 }
 
+/* 与 ov3660_reginfo_t 二进制兼容（{u16 reg; u8 val;}，TAIL: reg==0） */
+typedef struct { uint16_t reg; uint8_t val; } cam_reg_t;
+static cam_reg_t s_boost_regs[256];
+
+/*
+ * 构建高帧率档：克隆 small_yuv_fmt(240x240 YUYV) 的寄存器序列并改写时序/窗口寄存器。
+ *
+ * 物理推导（实测标定）：该模式 V 窗口=全高 1548 行、2x binning → 读出 774 行 ≈ VTS783，
+ * 即 VTS 已是读出下限，单减 VTS 会失步（0fps）。
+ * 帧率 = PCLK/(HTS×VTS)，PCLK 实测 40MHz（DVP 安全上限内不宜再升）。
+ * 提速唯一正道：中心裁剪读出窗口 → 行数变少 → VTS/HTS 同步缩小：
+ *   读出行数 ≈ 774·cV，HTS ≈ (1568·cH)+280，VTS ≈ 774·cV+12
+ *   fps ≈ 40MHz/(HTS×VTS)（c=1 时还原 25fps）
+ * 代价：视场按 cH×cV 缩小（数字变焦）。输出仍 240x240（sensor ISP 缩放）。
+ * bp 全 0 = 恢复原生表。
+ */
+typedef cam_boost_params_t boost_params_t;
+/* 实验性时钟树补丁（值来自 esp_cam_sensor 2.4.x 官方 JPEG 30fps 档，数据驱动移植） */
+typedef struct { int c303b, c303d, c3824; } boost_clk_t;
+static boost_clk_t s_boost_clk;
+
+static void patch_reg16(cam_reg_t *regs, size_t n, uint16_t reg_hi, int val)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (regs[i].reg == 0) break;
+        if (regs[i].reg == reg_hi)     regs[i].val = (val >> 8) & 0xFF;
+        if (regs[i].reg == reg_hi + 1) regs[i].val = val & 0xFF;
+    }
+}
+
+static bool build_boost_fmt(const boost_params_t *bp)
+{
+    if (!s_p.small_yuv_fmt) return false;
+    if (bp->vts == 0) { s_p.boost_valid = false; return false; }
+    size_t n = s_p.small_yuv_fmt->regs_size;
+    if (n == 0 || n > sizeof(s_boost_regs) / sizeof(s_boost_regs[0])) return false;
+    memcpy(s_boost_regs, s_p.small_yuv_fmt->regs, n * sizeof(cam_reg_t));
+    if (bp->vts)    patch_reg16(s_boost_regs, n, 0x380e, bp->vts);
+    if (bp->hts)    patch_reg16(s_boost_regs, n, 0x380c, bp->hts);
+    if (bp->vstart) patch_reg16(s_boost_regs, n, 0x3802, bp->vstart);
+    if (bp->vend)   patch_reg16(s_boost_regs, n, 0x3806, bp->vend);
+    if (bp->hstart) patch_reg16(s_boost_regs, n, 0x3800, bp->hstart);
+    if (bp->hend)   patch_reg16(s_boost_regs, n, 0x3804, bp->hend);
+    if (s_boost_clk.c303b >= 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (s_boost_regs[i].reg == 0) break;
+            if (s_boost_regs[i].reg == 0x303b) s_boost_regs[i].val = (uint8_t)s_boost_clk.c303b;
+            if (s_boost_regs[i].reg == 0x303d) s_boost_regs[i].val = (uint8_t)s_boost_clk.c303d;
+            if (s_boost_regs[i].reg == 0x3824) s_boost_regs[i].val = (uint8_t)s_boost_clk.c3824;
+        }
+    }
+
+    s_p.boost_fmt = *s_p.small_yuv_fmt;
+    s_p.boost_fmt.regs = s_boost_regs;
+    s_p.boost_fmt.regs_size = n;
+    int fps_est = (bp->hts && bp->vts) ? (int)(40000000LL / ((int64_t)bp->hts * bp->vts)) : 25;
+    s_p.boost_fmt.fps = fps_est;
+    static char boost_name[64];
+    snprintf(boost_name, sizeof(boost_name), "240x240_YUYV 窗口裁剪 VTS=%d HTS=%d(~%dfps)",
+             bp->vts, bp->hts, fps_est);
+    s_p.boost_fmt.name = boost_name;
+    s_p.boost_valid = true;
+    return true;
+}
+
+/* 高帧率档位表：实测标定（2026-10-07）。时钟树来自官方 JPEG30fps 档。
+ * 窗口垂直居中裁剪；VTS≈spanV/2+8。 */
+typedef struct {
+    int span_v;    /* 垂直读出跨度（1548=全高） */
+    int fps_expect;
+    const char *label;
+} hifps_level_t;
+static const hifps_level_t s_hifps_levels[] = {
+    [0] = { 1548, 25, "OFF" },
+    [1] = { 1548, 31, "L1 全视场" },
+    [2] = {  800, 59, "L2 V52%" },
+    [3] = {  640, 71, "L3 V41%" },
+    [4] = {  512, 87, "L4 V33%" },
+};
+
+void cam_boost_apply_level(int level)
+{
+    if (!s_p.small_yuv_fmt || level <= 0 ||
+        level >= (int)(sizeof(s_hifps_levels) / sizeof(s_hifps_levels[0]))) {
+        s_p.boost_valid = false;
+        return;
+    }
+    const hifps_level_t *lv = &s_hifps_levels[level];
+    int span_v = lv->span_v & ~7;
+    boost_params_t bp = {
+        .vts = span_v / 2 + 8,
+        .vstart = (1548 - span_v) / 2 & ~3,
+        .vend = ((1548 - span_v) / 2 & ~3) + span_v,
+        .hstart = 256, .hend = 1823,   /* 水平不动（H 侧改动会失步） */
+    };
+    s_boost_clk.c303b = 0x1e;   /* 官方 JPEG30fps 时钟树 */
+    s_boost_clk.c303d = 0x30;
+    s_boost_clk.c3824 = 0x0a;
+    if (build_boost_fmt(&bp)) {
+        static char name[64];
+        snprintf(name, sizeof(name), "240x240_YUYV hifps-%s(~%dfps)", lv->label, lv->fps_expect);
+        s_p.boost_fmt.name = name;
+        s_p.boost_fmt.fps = lv->fps_expect;
+        s_p.boost_level = level;
+        ESP_LOGI(TAG, "hifps L%d: spanV=%d VTS=%d → 预期 ~%dfps",
+                 level, span_v, bp.vts, lv->fps_expect);
+    }
+}
+
+
 /* ---------- 设备打开/格式设置/缓冲管理 ---------- */
 static int xioctl(int fd, unsigned long req, void *arg)
 {
@@ -317,9 +447,9 @@ static esp_err_t build_pipeline_locked(void)
         xioctl(s_p.cam_fd, VIDIOC_S_DQBUF_TIMEOUT, &tv);   /* 停靠握手依赖此超时 */
     }
 
-    /* 1) 切 sensor 格式（分辨率切换的唯一途径，见 API_NOTES.md 第 4 节） */
-    esp_cam_sensor_format_t fmt_copy = *f;
-    ESP_RETURN_ON_ERROR(xioctl(s_p.cam_fd, VIDIOC_S_SENSOR_FMT, &fmt_copy) ? ESP_FAIL : ESP_OK,
+    /* 1) 切 sensor 格式（分辨率切换的唯一途径）。
+     * 注意：驱动会保留该指针（dev->cur_format），必须传静态存储的格式（表项或 boost_fmt）。 */
+    ESP_RETURN_ON_ERROR(xioctl(s_p.cam_fd, VIDIOC_S_SENSOR_FMT, (void *)f) ? ESP_FAIL : ESP_OK,
                         TAG, "S_SENSOR_FMT");
     /* 2) 设置 DVP capture 格式并分配缓冲 */
     struct v4l2_format vfmt = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
@@ -516,6 +646,17 @@ esp_err_t cam_pipe_init(void)
     s_p.tgt_h = s_p.cur_fmt->height;
     s_p.dsc.kx = s_p.dsc.ky = 1;
     s_p.dsc.x0 = s_p.dsc.y0 = 0;
+    /* OV3660 高帧率母本：最小的 YUV 方形档（240x240） */
+    if (strcasecmp(s_p.info.sensor_name, "ov3660") == 0) {
+        for (uint32_t i = 0; i < s_p.fmt_array.count; i++) {
+            const esp_cam_sensor_format_t *f = &s_p.fmt_array.format_array[i];
+            if (is_yuv(f->format) && f->width == 240 && f->height == 240) {
+                s_p.small_yuv_fmt = f;
+                break;
+            }
+        }
+        cam_boost_apply_level(CAMTEST_OV3660_HIFPS_LEVEL);
+    }
     s_p.inited = true;
     return ESP_OK;
 }
@@ -523,19 +664,41 @@ esp_err_t cam_pipe_init(void)
 void cam_pipe_start(void)
 {
     xSemaphoreTake(s_p.api_lock, portMAX_DELAY);
-    if (!s_p.ring) {
+    /* cam_pipe_stop() 后 ring 仍在但 running=false，同样需要重建链路 */
+    if (!s_p.ring || !s_p.running) {
         esp_err_t err = build_pipeline_locked();
         ESP_ERROR_CHECK_WITHOUT_ABORT(err);
     }
     if (!s_p.cap_task_h) {
         xTaskCreatePinnedToCore(capture_task, "cam_cap", 6144, NULL, 14, &s_p.cap_task_h, 1);
         xTaskCreatePinnedToCore(encode_task, "cam_enc", 6144, NULL, 12, &s_p.enc_task_h, 1);
-        xEventGroupSetBits(s_p.ev, EV_RUN);
     }
+    xEventGroupSetBits(s_p.ev, EV_RUN);
     xSemaphoreGive(s_p.api_lock);
 }
 
-esp_err_t cam_pipe_apply(int w, int h, uint8_t quality, int fps_limit)
+/* 完全停流（切换到 USB 源时调用）：任务停靠到安全点 → STREAMOFF + 关 fd。
+ * 帧环/队列/任务句柄全部保留，cam_pipe_start() 可无损重启。 */
+void cam_pipe_stop(void)
+{
+    xSemaphoreTake(s_p.api_lock, portMAX_DELAY);
+    xEventGroupClearBits(s_p.ev, EV_RUN);
+    xEventGroupWaitBits(s_p.ev, EV_CAP_PARK | EV_ENC_PARK, pdFALSE, pdTRUE,
+                        pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(30));
+    teardown_pipeline_locked();
+    xSemaphoreGive(s_p.api_lock);
+}
+
+bool cam_pipe_scaled(int *native_w, int *native_h)
+{
+    bool scaled = s_p.running && (s_p.src_w != s_p.info.w || s_p.src_h != s_p.info.h);
+    if (scaled && native_w) *native_w = s_p.src_w;
+    if (scaled && native_h) *native_h = s_p.src_h;
+    return scaled;
+}
+
+esp_err_t cam_pipe_apply_vts(int w, int h, uint8_t quality, int fps_limit, int vts)
 {
     xSemaphoreTake(s_p.api_lock, portMAX_DELAY);
     /* 停任务（清 RUN，等两任务都停在安全点；最长 2 s） */
@@ -546,31 +709,42 @@ esp_err_t cam_pipe_apply(int w, int h, uint8_t quality, int fps_limit)
 
     const esp_cam_sensor_format_t *want = NULL;
     int vkx = 1, vky = 1, vx0 = 0, vy0 = 0;
+    (void)vts;   /* boost 由 apply_boost 预先构建；此入口不再单独改 VTS */
     if (w && h) {
-        /* 1) 原生精确匹配：同分辨率多格式时优先 YUV422，RGB565 次之 */
-        const esp_cam_sensor_format_t *fallback = NULL;
-        for (uint32_t i = 0; i < s_p.fmt_array.count; i++) {
-            const esp_cam_sensor_format_t *f = &s_p.fmt_array.format_array[i];
-            if (f->width == w && f->height == h && fmt_hw_encodable(f->format)) {
-                if (is_yuv(f->format)) { want = f; break; }
-                if (!fallback) fallback = f;
+        /* 候选 = 原生表 ∪ {boost}；评分 = 帧率为主，同分时 原生直通 > 整数抽取(保全视场) > 裁剪 */
+        int best_score = -1;
+        for (int pass = 0; pass < 2; pass++) {   /* 两轮都评分：原生表 ∪ boost 取最高分 */
+            const esp_cam_sensor_format_t *tab = (pass == 0) ? s_p.fmt_array.format_array
+                                                  : (s_p.boost_valid ? &s_p.boost_fmt : NULL);
+            uint32_t count = (pass == 0) ? s_p.fmt_array.count : (s_p.boost_valid ? 1 : 0);
+            for (uint32_t i = 0; i < count; i++) {
+                const esp_cam_sensor_format_t *f = &tab[i];
+                if (!fmt_hw_encodable(f->format) || !is_yuv(f->format)) continue;
+                int kx, ky, x0, y0, score;
+                if (f->width == w && f->height == h) {
+                    kx = ky = 1; x0 = y0 = 0;
+                    score = f->fps * 100 + 3;
+                } else if (plan_virtual(f->width, f->height, w, h, &kx, &ky, &x0, &y0)) {
+                    score = f->fps * 100 + ((kx > 1 || ky > 1) ? 2 : 1);
+                } else {
+                    continue;
+                }
+                if (score > best_score) {
+                    best_score = score;
+                    want = f; vkx = kx; vky = ky; vx0 = x0; vy0 = y0;
+                }
             }
         }
-        if (!want) want = fallback;
-        /* 2) 虚拟档：整数抽取优先（保全视场），其次中心裁剪；YUV 源优先 */
+        /* YUV 无解时允许 RGB 候选（兜底） */
         if (!want) {
-            const esp_cam_sensor_format_t *fb = NULL;
-            int fkx=1, fky=1, fx0=0, fy0=0;
             for (uint32_t i = 0; i < s_p.fmt_array.count; i++) {
                 const esp_cam_sensor_format_t *f = &s_p.fmt_array.format_array[i];
                 if (!fmt_hw_encodable(f->format)) continue;
                 int kx, ky, x0, y0;
-                if (!plan_virtual(f->width, f->height, w, h, &kx, &ky, &x0, &y0)) continue;
-                if (is_yuv(f->format)) { want = f; vkx=kx; vky=ky; vx0=x0; vy0=y0; break; }
-                if (!fb) { fb = f; fkx=kx; fky=ky; fx0=x0; fy0=y0; }
-            }
-            if (!want && fb) {
-                want = fb; vkx=fkx; vky=fky; vx0=fx0; vy0=fy0;
+                if (f->width == w && f->height == h) { want = f; vkx=vky=1; vx0=vy0=0; break; }
+                if (plan_virtual(f->width, f->height, w, h, &kx, &ky, &x0, &y0)) {
+                    want = f; vkx=kx; vky=ky; vx0=x0; vy0=y0; break;
+                }
             }
         }
         if (!want) { /* 恢复运行后报不支持 */
@@ -594,6 +768,23 @@ esp_err_t cam_pipe_apply(int w, int h, uint8_t quality, int fps_limit)
     xEventGroupSetBits(s_p.ev, EV_RUN);
     xSemaphoreGive(s_p.api_lock);
     return err;
+}
+
+esp_err_t cam_pipe_apply(int w, int h, uint8_t quality, int fps_limit)
+{
+    return cam_pipe_apply_vts(w, h, quality, fps_limit, 0);
+}
+
+/* 带 boost 窗口参数的重建：bp 非空且 vts>0 时启用，否则清除 boost */
+esp_err_t cam_pipe_apply_boost(int w, int h, uint8_t quality, int fps_limit,
+                               const cam_boost_params_t *bp)
+{
+    if (bp && bp->vts > 0) {
+        if (!build_boost_fmt(bp)) return ESP_ERR_INVALID_ARG;
+    } else {
+        s_p.boost_valid = false;
+    }
+    return cam_pipe_apply_vts(w, h, quality, fps_limit, 0);
 }
 
 frame_ring_t *cam_pipe_ring(void) { return s_p.ring; }
@@ -665,4 +856,14 @@ int cam_pipe_supported_res(char *out, size_t outlen)
         n++;
     }
     return n;
+}
+
+int cam_boost_level(void) { return s_p.boost_level; }
+
+/* 实验台：在线改写时钟树补丁（-1 = 保持当前值） */
+void cam_boost_clk_set(int c303b, int c303d, int c3824)
+{
+    if (c303b >= 0) s_boost_clk.c303b = c303b;
+    if (c303d >= 0) s_boost_clk.c303d = c303d;
+    if (c3824 >= 0) s_boost_clk.c3824 = c3824;
 }
