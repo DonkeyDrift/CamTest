@@ -11,6 +11,7 @@
 #include "mdns.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "wifi_net";
@@ -22,6 +23,7 @@ static EventGroupHandle_t s_ev;
 #define EV_AP_STARTED (1 << 1)
 static wifi_info_t s_info;
 static volatile wifi_op_mode_t s_desired;
+static volatile bool s_sta_recovery;   /* 开机回退 SoftAP 后周期重试 STA（否则路由器一次启动期拒连=设备永久失联） */
 
 static void ip_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -117,6 +119,27 @@ static esp_err_t start_one(wifi_op_mode_t mode)
     return ESP_OK;
 }
 
+/* SoftAP 兜底期间每 30s 重试一次 STA：路由器启动期/闪断导致的拒连不该让设备
+ * 永久困在 SoftAP（真机两次复现：刷机重启后 STA 首连超时→终态回退）。
+ * 每轮重试期间 AP 会短暂下线（最长 15s 连接超时），重试失败即恢复 AP 保住网页可达。
+ * 用户显式 wifi_net_switch 切换后自动放弃（s_sta_recovery=false）。 */
+static void sta_recovery_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        if (!s_sta_recovery || s_desired != WIFI_MODE_AP_M) break;
+        ESP_LOGW(TAG, "SoftAP 兜底中：重试 STA 连接（AP 暂时下线 ≤15s）…");
+        esp_wifi_stop();
+        vTaskDelay(pdMS_TO_TICKS(300));
+        if (start_one(WIFI_MODE_STA_M) == ESP_OK) {
+            ESP_LOGI(TAG, "STA 恢复成功，退出 SoftAP 兜底");
+            break;
+        }
+        start_one(WIFI_MODE_AP_M);   /* 尽力恢复 AP（网页可达优先） */
+    }
+    vTaskDelete(NULL);
+}
+
 esp_err_t wifi_net_start(void)
 {
     s_ev = xEventGroupCreate();
@@ -140,9 +163,13 @@ esp_err_t wifi_net_start(void)
     esp_err_t err = start_one(mode);
 #if !CONFIG_CAMTEST_WIFI_MODE_AP
     if (err == ESP_ERR_TIMEOUT) {
-        /* STA 连不上：回退 SoftAP，保证浏览器总能连上（UI 会显示降级） */
-        ESP_LOGE(TAG, "STA failed → fallback SoftAP");
+        /* STA 连不上：回退 SoftAP，保证浏览器总能连上（UI 会显示降级）；
+         * 同时后台每 30s 重试 STA——路由器闪断不该把设备永久困在 SoftAP */
+        ESP_LOGE(TAG, "STA failed → fallback SoftAP（后台将每 30s 重试 STA）");
+        s_sta_recovery = true;
         err = start_one(WIFI_MODE_AP_M);
+        if (xTaskCreate(sta_recovery_task, "sta_retry", 4096, NULL, 5, NULL) != pdPASS)
+            s_sta_recovery = false;
     }
 #endif
     return err;
@@ -151,6 +178,7 @@ esp_err_t wifi_net_start(void)
 esp_err_t wifi_net_switch(wifi_op_mode_t mode)
 {
     if (mode == s_info.mode) return ESP_OK;
+    s_sta_recovery = false;   /* 显式切换：放弃开机回退的自动恢复 */
     ESP_LOGW(TAG, "switching wifi mode %d → %d", s_info.mode, mode);
     esp_wifi_stop();
     vTaskDelay(pdMS_TO_TICKS(300));

@@ -74,7 +74,7 @@ UVC 推流开始：MJPEG 640x480 quality=0 fps_limit=0
 | MJPEG 流 | `http://<host>:81/stream` | `multipart/x-mixed-replace`；part 头带每帧元数据 |
 | WebSocket | `ws://<host>:81/ws` | 二进制帧（36B 小端头 + JPEG），协议开销对比用 |
 | UDP 分片 | 设备 UDP `:9100` | 用 `tools/udp_receiver.py`（浏览器收不了 UDP）；可能花屏 |
-| 光学校验 | `http://<host>/overlay` | 画面毫秒叠加开关 + 校验操作说明 |
+| 光学校验 | `http://<host>/overlay` | 原理说明 + 画面毫秒叠加开关；主页 USB 卡片内置标定向导（毫秒计时器 + 读数采样 + 自动扣纪元差 + 一键写入①） |
 
 **为什么 /stream、/ws 在 81 端口**：esp_http_server 单 task 分发，长连接会阻塞其他会话；
 81 端口用原生 socket 每客户端独立任务，支持 2~4 个并发观看端并分别统计（:80 的 API 不受影响）。
@@ -344,7 +344,7 @@ main/
 ├── camera_pipeline.c DVP 采集 → 硬件 JPEG(M2M) → 帧环；分辨率切换重建；三任务流水
 ├── frame_ring.c      最新帧环形发布/订阅（PSRAM + 引用计数；丢帧式；槽带 source/scaled/ts_meaning 元数据）
 ├── yuv_osd.c         5x7 毫秒计数器叠加（光学闭环；USB 仅 reencode 模式可叠加）
-├── wifi_net.c        STA/SoftAP + mDNS + RSSI/PHY + SNTP(可选)
+├── wifi_net.c        STA/SoftAP + mDNS + RSSI/PHY + SNTP(可选)；SoftAP 兜底后每 30s 自动重试 STA
 ├── stream_server.c   :81 原生 socket 流服务（/stream、/ws、UDP 分片），每客户端独立任务，TCP_NODELAY
 ├── http_server.c     :80 管理 API（esp_http_server；含 USB 状态/档位/标定值）
 ├── metrics.c         每秒聚合（FPS/码率/CPU/内存/栈水位）+ 串口 CSV + 码率自适应降质（直通模式仅告警）
