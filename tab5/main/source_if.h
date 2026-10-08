@@ -68,6 +68,8 @@ typedef struct {
     uint32_t out_drops;            /* 输出侧丢帧（编码忙/环满） */
     uint64_t out_bytes;            /* 输出字节累计 */
     uint64_t proc_acc_us;          /* 输出处理耗时累计（重编码=解码+编码耗时） */
+    uint32_t pv_frames;            /* JPEG 预览流帧数（h264 模式并行发布） */
+    uint64_t pv_bytes;             /* JPEG 预览流字节累计 */
 } src_stats_t;
 
 /* ---------- 生命周期 ---------- */

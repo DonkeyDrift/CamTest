@@ -120,7 +120,7 @@ static esp_err_t h_status(httpd_req_t *req)
         "\"sensor\":\"%s\",\"usb_device\":\"%s\","
         "\"res\":\"%ux%u\",\"native\":\"%ux%u\",\"scaled\":%s,"
         "\"pix_fmt\":\"%s\",\"fmt\":\"%s\",\"quality\":%u,"
-        "\"fps\":{\"capture\":%.2f,\"encode\":%.2f,\"send\":%.2f},\"fps_limit\":%d,"
+        "\"fps\":{\"capture\":%.2f,\"encode\":%.2f,\"send\":%.2f,\"preview\":%.2f},\"fps_limit\":%d,"
         "\"ts_meaning\":\"%s\","
         "\"jpeg_avg_bytes\":%u,\"bitrate_mbps\":%.3f,"
         "\"cpu0\":%.1f,\"cpu1\":%.1f,"
@@ -139,7 +139,7 @@ static esp_err_t h_status(httpd_req_t *req)
         ci->sensor_name, ci->usb_device_name,
         ci->w, ci->h, ci->native_w, ci->native_h, ci->scaled ? "true" : "false",
         ci->pix_fmt_str, ci->fmt_name, ci->quality,
-        m->cap_fps, m->enc_fps, m->send_fps, ci->fps_limit,
+        m->cap_fps, m->enc_fps, m->send_fps, m->pv_fps, ci->fps_limit,
         src_if_ts_meaning_name(ci->ts_meaning),
         (unsigned)m->jpeg_avg_bytes, m->bitrate_mbps,
         m->cpu0, m->cpu1,

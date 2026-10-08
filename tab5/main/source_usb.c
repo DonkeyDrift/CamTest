@@ -561,8 +561,10 @@ static esp_err_t encoder_open(int out_w, int out_h, int fps)
             ESP_LOGW(TAG, "H.264 输入对齐到 %ux%u（请求 %ux%u，出帧头仍标 %ux%u）",
                      ew, eh, s_u.out_w, s_u.out_h);
         }
-    } else {
-        /* reencode：P4 硬件 JPEG 编码器（esp_driver_jpeg 直驱） */
+    }
+    /* JPEG 编码引擎：reencode 主路径 / h264 预览流（无 WebCodecs 的浏览器靠它出画面；
+     * 解码帧本就在手，仅多一次 ~6ms 硬编码，15fps 帧预算 66ms 充裕） */
+    {
         jpeg_encode_engine_cfg_t ecfg = { .intr_priority = 0, .timeout_ms = ENC_TIMEOUT_MS };
         esp_err_t eerr = jpeg_new_encoder_engine(&ecfg, &s_u.jenc);
         if (eerr != ESP_OK) {
@@ -994,6 +996,51 @@ static void worker_task(void *arg)
                     s_u.stats.proc_acc_us += t_enc_done - t_arr;
                 } else {
                     s_u.stats.out_drops++;
+                }
+                /* JPEG 预览流（与 H264 同源同刻）：无 WebCodecs 的浏览器（Safari/
+                 * WKWebView/http 直连的 Chrome——WebCodecs 是 Secure-Context-Only）
+                 * 靠它显示画面；有 WebCodecs 的页面按 magic 过滤不渲染。
+                 * 统计走 pv_* 独立计数，不污染主指标（out_frames=H264 出帧）。
+                 * ★ 自适应让路：相机输出帧率随枚举波动（全速下实测 15~24fps），
+                 *   上一帧总处理超 40ms（>24fps 周期的安全余量）时跳过本帧预览，
+                 *   保 H264 主链不堆积；空闲时预览全速 */
+                static uint64_t last_total_us;
+                uint64_t total_us = t_enc_done - t_arr;
+                if (s_u.jenc && s_u.jenc_in.start && s_u.jenc_out.start &&
+                    last_total_us < 40000) {
+                    fill_encoder_input(s_u.jenc_in.start, s_u.dec_out, s_u.w, s_u.h,
+                                       s_u.out_w, s_u.out_h, kx, ky, x0, y0,
+                                       false, t_arr);   /* false=不交换字节序；OSD 已在 dec_out（重绘同值无害） */
+                    jpeg_encode_cfg_t pec = {
+                        .width = s_u.out_w,
+                        .height = s_u.out_h,
+                        .src_type = JPEG_ENCODE_IN_FORMAT_YUV422,
+                        .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
+                        .image_quality = s_u.quality ? s_u.quality : 30,
+                        .pixel_reverse = false,
+                    };
+                    uint32_t psize = 0;
+                    esp_err_t perr = jpeg_encoder_process(s_u.jenc, &pec, s_u.jenc_in.start,
+                                                          (uint32_t)s_u.out_w * s_u.out_h * 2,
+                                                          s_u.jenc_out.start, s_u.jenc_out.length,
+                                                          &psize);
+                    if (perr == ESP_OK && psize > 0) {
+                        frame_meta_t pm = { .source = FRAME_SRC_USB,
+                                            .scaled = scaled,
+                                            .ts_meaning = FRAME_TS_FRAME_ARRIVAL,
+                                            .codec = FRAME_CODEC_JPEG,
+                                            .key = 0 };
+                        if (frame_ring_publish_ex(src_if_ring(), s_u.jenc_out.start, psize,
+                                                  t_arr, esp_timer_get_time(),
+                                                  s_u.out_w, s_u.out_h,
+                                                  s_u.quality ? s_u.quality : 30, &pm)) {
+                            s_u.stats.pv_frames++;
+                            s_u.stats.pv_bytes += psize;
+                        }
+                    }
+                    last_total_us = esp_timer_get_time() - t_arr;   /* 含预览的完整耗时 */
+                } else {
+                    last_total_us = total_us;   /* 跳过预览帧也记录（主链耗时） */
                 }
             } else {
                 /* reencode：P4 硬件 JPEG 编码器 */

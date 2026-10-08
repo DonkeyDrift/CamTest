@@ -285,7 +285,10 @@ async function syncClock(){
 /* ============================== H.264 WebCodecs 播放器 ==============================
  * 设备侧 esp_h264 输出 Annex-B access unit（IDR 自动前置 SPS/PPS）。
  * 无 description → WebCodecs 按 Annex-B 解析。optimizeForLatency 逐帧出图不等缓冲。
- * 起播/解码器重建后必须等 IDR（key=1）才 feed delta，否则持续 ReferenceMissing。 */
+ * 起播/解码器重建后必须等 IDR（key=1）才 feed delta，否则持续 ReferenceMissing。
+ * 无 WebCodecs 的浏览器（Safari/WKWebView）：设备并行发布的 JPEG 预览流出画面，
+ * H264 帧在此被过滤（不进统计不进渲染），指标口径与 Chrome 一致。 */
+const HAS_WEBCODECS = "VideoDecoder" in window;
 const V = { dec:null, w:0, h:0, needKey:true, decFrames:0, decErrs:0, latSum:0, lastDispUs:0 };
 function vdecReset(){
   if(V.dec){ try{V.dec.close();}catch(e){} }
@@ -319,7 +322,8 @@ function vdecEnsure(w,h){
   }catch(e){ console.warn("vdec cfg",e); return false; }
 }
 function feedH264(meta, au, arriveUs){
-  if(!vdecEnsure(meta.w,meta.h)){ banner("此浏览器不支持 WebCodecs，请用 Chrome/Edge，或切换 passthrough+HTTP 模式"); return; }
+  if(!HAS_WEBCODECS) return;   /* h264 帧在 onFrame 已过滤，不会到这里（防御） */
+  if(!vdecEnsure(meta.w,meta.h)){ banner("VideoDecoder 初始化失败，请刷新或换 Chrome/Edge"); return; }
   if(V.dec.state!=="configured") return;
   if(V.needKey){
     if(!meta.key) return;            /* 等 IDR 再起播（gop=30 → ≤1s） */
@@ -439,8 +443,11 @@ async function streamLoop(){
 let drawing=false;
 function onFrame(meta, payload, arriveUs){
   if(S.offsetUs==null) return;
-  /* 传输时延 = 到达(客户端钟) − 设备侧打点 + offset。
-   * H264 模式先记 capDevUs，等解码输出后再修正为"上屏时延"（见 vdec output 回调） */
+  /* 双流分流：设备 h264 模式并行发布 H264（主）+ JPEG（预览，供无 WebCodecs 浏览器）。
+   * 每个观看端只消费其一，统计口径与单流完全一致 */
+  const devH264 = S.status && S.status.device && S.status.device.usb_mode==="h264";
+  if(meta.codec==="h264" && !HAS_WEBCODECS) return;         /* 解不了 H264：等预览帧 */
+  if(meta.codec==="jpeg" && devH264 && HAS_WEBCODECS) return; /* Chrome：忽略冗余预览流 */
   const latTxUs=arriveUs - meta.cap + S.offsetUs;
   const encUs=meta.enc - meta.cap;
   S.frames.push({arrive:arriveUs, lat:latTxUs, latTx:latTxUs, enc:encUs, len:meta.len, fid:meta.fid,
@@ -546,6 +553,13 @@ function renderStatus(){
   if(!$("cUsbMode").dataset.editing && dev.usb_mode && $("cUsbMode").value!==dev.usb_mode)
     $("cUsbMode").value=dev.usb_mode;
   banner(null);
+  /* 编码流标签：h264 模式按浏览器能力显示主/预览流。
+   * ★ WebCodecs 是 Secure-Context-Only API：http://IP 直连时连 Chrome 也不暴露
+   *   VideoDecoder——JPEG 预览流覆盖所有 http 场景；H264 解码需 https 访问 */
+  $("codecNote").style.display = dev.usb_mode==="h264" ? "" : "none";
+  $("codecNote").textContent = HAS_WEBCODECS ? "H.264 硬件解码" : "JPEG 预览流（无 WebCodecs）";
+  $("codecNote").title = HAS_WEBCODECS ? "" :
+    "WebCodecs 仅在 Secure Context（https / localhost）暴露；http 直连时统一走设备并行发布的 JPEG 预览流，延迟与指标同源";
   $("bSource").innerHTML="源 <b>USB "+(dev.usb_device||"")+"</b>"+(dev.scaled?"·缩放":"");
   $("bSource").className="badge "+(usb.state==="streaming"?"ok":"warn");
   $("bSensor").innerHTML="sensor <b>"+(dev.sensor||"?")+"</b> · "+(dev.pix_fmt||"?");
@@ -653,7 +667,6 @@ function switchTransport(){
   if(S.ws){ const o=S.ws; S.ws=null; o.onclose=null; o.onerror=null; try{o.close();}catch(e){} }
   vdecReset();
   $("transportNote").textContent=S.transport==="http"?"HTTP MJPEG":"WebSocket 二进制";
-  $("codecNote").style.display="none";
   S.frames.length=0;
   if(S.transport==="http") streamLoop();
   else if(S.transport==="ws") wsLoop();

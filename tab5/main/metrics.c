@@ -105,8 +105,8 @@ static void governor_tick(void)
 
 static void metrics_task(void *arg)
 {
-    uint32_t last_cap = 0, last_enc = 0, last_bytes = 0;
-    uint64_t last_enc_bytes = 0;
+    uint32_t last_cap = 0, last_enc = 0, last_bytes = 0, last_pv = 0;
+    uint64_t last_enc_bytes = 0, last_pv_bytes = 0;
     uint64_t last_us = esp_timer_get_time();
     int cpu_tick = 0;
     uint32_t last_total_sent_frames = 0;
@@ -121,19 +121,26 @@ static void metrics_task(void *arg)
         uint32_t sent_frames = stream_server_frames_sent();
         uint32_t bytes_now = stream_server_bytes_sent();
         uint64_t enc_bytes_now = ps->out_bytes;
+        uint32_t pv_now = ps->pv_frames;
+        uint64_t pv_bytes_now = ps->pv_bytes;
         uint32_t d_cap = cap_now - last_cap;
         uint32_t d_enc = enc_now - last_enc;
         uint32_t d_bytes = bytes_now - last_bytes;
         uint64_t d_enc_bytes = enc_bytes_now - last_enc_bytes;
+        uint32_t d_pv = pv_now - last_pv;
+        uint64_t d_pv_bytes = pv_bytes_now - last_pv_bytes;
         uint32_t d_sent = sent_frames - last_total_sent_frames;
 
         s_m.cap_fps = d_cap / sec;
         s_m.enc_fps = d_enc / sec;
         s_m.send_fps = d_sent / sec;
         s_m.bitrate_mbps = d_enc_bytes * 8 / sec / 1e6;         /* 设备侧（编码输出）码率 */
+        s_m.pv_fps = d_pv / sec;
+        s_m.pv_mbps = d_pv_bytes * 8 / sec / 1e6;
         s_m.jpeg_avg_bytes = d_enc ? (uint32_t)(d_enc_bytes / d_enc) : 0;
         last_cap = cap_now; last_enc = enc_now; last_bytes = bytes_now;
         last_enc_bytes = enc_bytes_now;
+        last_pv = pv_now; last_pv_bytes = pv_bytes_now;
         last_total_sent_frames = sent_frames;
         last_us = now;
 

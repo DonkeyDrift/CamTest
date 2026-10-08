@@ -90,6 +90,15 @@ C6 Wi-Fi（esp_hosted SDIO）←— esp_wifi_remote（IDF v6.1 内置）
 60s 重启（USB 重枚举自愈）、cam_watch 流冻结 20s 兜底、NVS 按字段持久化
 （CTM2 布局）、开流收尾归还竞态帧。
 
+## 观看方式与 WebCodecs 的 Secure Context 陷阱
+
+**WebCodecs（VideoDecoder）只在 Secure Context 暴露**：`http://192.168.x.x` 直连时，
+**连 Chrome/Edge 也没有 VideoDecoder**（实测 UA Chrome/146，`isSecureContext=false`）。
+因此固件在 h264 模式下**并行发布一条 JPEG 预览流**（与 H264 同源同刻、独立
+pv_* 计数不污染主指标）：无 WebCodecs 的页面自动渲染预览流，有 WebCodecs 的
+自动忽略它——所有 http 观看端都能出画面。要吃到真正的 H.264 硬解路径，需
+`https://` 访问（自签证书）或 localhost 端口转发。
+
 ## 已知限制 / 后续工作
 
 - **720p H264 只有 8fps**：解码+重排+编码在 720p 下超帧预算（估计重排 ~32ms+

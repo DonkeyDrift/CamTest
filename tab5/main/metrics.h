@@ -11,6 +11,7 @@ extern "C" {
 typedef struct {
     float cap_fps, enc_fps, send_fps;
     float bitrate_mbps;
+    float pv_fps, pv_mbps;          /* JPEG 预览流（h264 模式并行发布给无 WebCodecs 浏览器） */
     uint32_t jpeg_avg_bytes;
     float cpu0, cpu1;
     uint32_t free_heap, min_heap, free_psram, min_psram;
