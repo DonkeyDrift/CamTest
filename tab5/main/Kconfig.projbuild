@@ -53,6 +53,10 @@ menu "CamTest Tab5 Configuration"
         bool "启用 USB UVC 摄像头采集通路（usb_host_uvc 原生 API，热插拔）"
         default y
 
+    config CAMTEST_ENABLE_DVP
+        bool "启用板载 MIPI 相机采集通路（SC202CS，esp_video CSI+ISP）"
+        default y
+
     choice CAMTEST_USB_DEFAULT_MODE
         prompt "USB 摄像头默认工作模式"
         default CAMTEST_USB_DEFAULT_MODE_H264

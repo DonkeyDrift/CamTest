@@ -4,6 +4,7 @@ idf_component_register(
          "board_power.c"
          "source_if.c"
          "source_usb.c"
+         "source_dvp.c"
          "h264_pipeline.c"
          "frame_ring.c"
          "yuv_osd.c"
@@ -16,4 +17,5 @@ idf_component_register(
     EMBED_FILES "fs_web/index.html"
     REQUIRES esp_wifi nvs_flash esp_http_server cjson mdns esp_psram mbedtls
              usb usb_host_uvc esp_driver_jpeg esp_driver_i2c esp_driver_ppa esp_h264
+             esp_video esp_cam_sensor
 )

@@ -68,3 +68,9 @@ esp_err_t board_camera_enable(bool on)
     ESP_LOGI(TAG, "MIPI 相机电源 %s", on ? "ON" : "OFF");
     return err;
 }
+
+void *board_i2c_handle(void)
+{
+    board_power_init();
+    return (void *)s_i2c;
+}
