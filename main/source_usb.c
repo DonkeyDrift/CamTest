@@ -46,6 +46,7 @@
 #include "linux/videodev2.h"
 #include "esp_video_device.h"
 #include "esp_video_ioctl.h"    /* VIDIOC_S_DQBUF_TIMEOUT（esp_video 自定义 ioctl） */
+#include "driver/jpeg_decode.h" /* S31 硬件 JPEG 解码：MJPEG 档重编码路径（YUY2 档只有 10fps） */
 #include "camera_pipeline.h"     /* cam_pipe_ring()：共享帧环；编码器设备号约定 */
 #include "yuv_osd.h"
 #include "sdkconfig.h"
@@ -104,6 +105,14 @@ struct usb_priv_s {
     struct { uint8_t *start; size_t length; } enc_in[ENC_IN_BUFS], enc_out[ENC_OUT_BUFS];
     QueueHandle_t enc_free_in;
 
+    /* MJPEG 硬解码（reencode 且当前流为 MJPEG 档）：JPEG→UYVY 直写解码缓冲，
+     * 解码/编码为独立引擎实例、worker 内串行使用。0bda:1376 的 YUY2 全档只有
+     * 10fps（描述符上限），MJPEG 档才有 60fps——带计数器的重编码必须走此路径 */
+    jpeg_decoder_handle_t dec;
+    uint8_t *dec_out;                           /* 解码输出（native 尺寸 UYVY，jpeg_alloc_decoder_mem） */
+    size_t dec_out_len;
+    bool dec_src_mjpeg;                         /* 当前流是否 MJPEG 档（开流时确定） */
+
     /* 同步 */
     QueueHandle_t work_q;                       /* uvc_host_frame_t* */
     SemaphoreHandle_t lock;                     /* 状态机互斥 */
@@ -148,16 +157,22 @@ static bool plan_virtual(int sw, int sh, int tw, int th, int *kx, int *ky, int *
     return false;
 }
 
-/* YUY2 源 → 编码器输入（UYVY）：整数抽取/中心裁剪 + 字节序交换 + 可选 OSD */
+/* → 编码器输入（UYVY）：整数抽取/中心裁剪 + 可选字节序交换 + 可选 OSD。
+ * swap_bytes：YUY2 摄像头源需交换为 UYVY；MJPEG 硬解码输出已是 UYVY，传 false 免一次全帧交换 */
 static void fill_encoder_input(uint8_t *dst, const uint8_t *src, int sw, int sh,
-                               int tw, int th, int kx, int ky, int x0, int y0, uint64_t now_us)
+                               int tw, int th, int kx, int ky, int x0, int y0,
+                               bool swap_bytes, uint64_t now_us)
 {
     const size_t srow = (size_t)sw * 2, drow = (size_t)tw * 2;
     const bool passthrough = (tw == sw && th == sh && kx == 1 && ky == 1 && x0 == 0 && y0 == 0);
     if (passthrough) {
         const uint16_t *sp = (const uint16_t *)src;
         uint16_t *dp = (uint16_t *)dst;
-        for (size_t i = 0; i < drow * sh / 2; i++) dp[i] = __builtin_bswap16(sp[i]);
+        if (swap_bytes) {
+            for (size_t i = 0; i < drow * sh / 2; i++) dp[i] = __builtin_bswap16(sp[i]);
+        } else {
+            memcpy(dp, sp, drow * sh);
+        }
     } else {
         for (int ty = 0; ty < th; ty++) {
             const uint8_t *sr = src + (size_t)(y0 + ty * ky) * srow;
@@ -165,7 +180,8 @@ static void fill_encoder_input(uint8_t *dst, const uint8_t *src, int sw, int sh,
             for (int tx = 0; tx < tw; tx += 2) {
                 const uint8_t *sp = sr + ((size_t)(x0 / 2) + (size_t)(tx / 2) * kx) * 4;
                 uint8_t *dp = dr + (size_t)tx * 2;
-                dp[0]=sp[1]; dp[1]=sp[0]; dp[2]=sp[3]; dp[3]=sp[2];
+                if (swap_bytes) { dp[0]=sp[1]; dp[1]=sp[0]; dp[2]=sp[3]; dp[3]=sp[2]; }
+                else            { dp[0]=sp[0]; dp[1]=sp[1]; dp[2]=sp[2]; dp[3]=sp[3]; }
             }
         }
     }
@@ -411,12 +427,42 @@ static void encoder_close(void)
             s_u.enc_in[i].length = 0;
         }
     }
+    if (s_u.dec) {
+        jpeg_del_decoder_engine(s_u.dec);
+        s_u.dec = NULL;
+    }
+    if (s_u.dec_out) {
+        heap_caps_free(s_u.dec_out);               /* jpeg_alloc_decoder_mem 配对释放 */
+        s_u.dec_out = NULL;
+        s_u.dec_out_len = 0;
+    }
 }
 
 static esp_err_t encoder_open(int w, int h, uint8_t quality)
 {
-    ESP_LOGI(TAG, "encoder_open: %dx%d q%u（/dev/video10）", w, h, quality);
+    ESP_LOGI(TAG, "encoder_open: %dx%d q%u（/dev/video10%s）", w, h, quality,
+             s_u.dec_src_mjpeg ? "，MJPEG 输入＋硬解码" : "");
     if (s_u.enc_fd >= 0) encoder_close();   /* 重入防护：上次 teardown 时 worker 忙未关 */
+    if (s_u.dec_src_mjpeg) {
+        /* 解码引擎先建：JPEG→UYVY 输出直写 SPIRAM（2D-DMA 支 PSRAM，驱动内部做 cache 维护）。
+         * 输出尺寸按 JPEG 协议 16 对齐向上取整；与编码引擎为独立实例，worker 内串行无争用 */
+        jpeg_decode_engine_cfg_t ecfg = { .intr_priority = 0, .timeout_ms = ENC_DQBUF_TIMEOUT_MS };
+        esp_err_t derr = jpeg_new_decoder_engine(&ecfg, &s_u.dec);
+        if (derr != ESP_OK) {
+            ESP_LOGE(TAG, "jpeg 解码引擎创建失败 %s", esp_err_to_name(derr));
+            return ESP_FAIL;
+        }
+        int nw = (s_u.w + 15) & ~15, nh = (s_u.h + 15) & ~15;   /* native 尺寸（开流时已置） */
+        jpeg_decode_memory_alloc_cfg_t mcfg = { .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER };
+        s_u.dec_out = jpeg_alloc_decoder_mem((size_t)nw * nh * 2, &mcfg, &s_u.dec_out_len);
+        if (!s_u.dec_out) {
+            ESP_LOGE(TAG, "解码输出缓冲分配失败（%dx%d UYVY）", nw, nh);
+            encoder_close();
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "MJPEG 硬解码就绪：%dx%d→UYVY（缓冲 %u KB）", s_u.w, s_u.h,
+                 (unsigned)(s_u.dec_out_len / 1024));
+    }
     s_u.enc_fd = open(ESP_VIDEO_JPEG_DEVICE_NAME, O_RDWR);   /* /dev/video10 */
     ESP_RETURN_ON_FALSE(s_u.enc_fd >= 0, ESP_FAIL, TAG, "open %s", ESP_VIDEO_JPEG_DEVICE_NAME);
     struct timeval tv = { .tv_sec = 0, .tv_usec = ENC_DQBUF_TIMEOUT_MS * 1000 };
@@ -495,16 +541,19 @@ fail:
     return ESP_FAIL;
 }
 
-/* ---------- 档位选择：返回 frame_info 下标；-1 = 不支持 ---------- */
-static int pick_native(bool mjpeg_only, int want_w, int want_h)
+/* ---------- 档位选择：返回 frame_info 下标；-1 = 不支持 ----------
+ * want_mjpeg：只看 MJPEG 档；scalable_ok：允许"大原生档→缩放/裁剪到目标"（直通必须原生精确，
+ * 重编码在解码后缩放，MJPEG/YUY2 档都允许）。reencode 优先 MJPEG 档——0bda:1376 的
+ * YUY2 全档只有 10fps（描述符上限），MJPEG 档才有 60fps，硬解码后帧率不再受限 */
+static int pick_native(bool want_mjpeg, int want_w, int want_h, bool scalable_ok)
 {
     int fallback = -1;      /* 未指定分辨率时的默认档 */
     int fallback_640 = -1;  /* 未指定时优先 640x480（与 DVP 对比口径一致，PSRAM 友好） */
-    int scalable = -1;      /* 重编码可缩放达标的档 */
+    int scalable = -1;      /* 可缩放达标的档 */
     for (size_t i = 0; i < s_u.frame_info_n; i++) {
         uvc_host_frame_info_t *fi = &s_u.frame_info[i];
-        if (mjpeg_only && fi->format != UVC_VS_FORMAT_MJPEG) continue;
-        if (!mjpeg_only && fi->format != UVC_VS_FORMAT_YUY2) continue;
+        if (want_mjpeg && fi->format != UVC_VS_FORMAT_MJPEG) continue;
+        if (!want_mjpeg && fi->format != UVC_VS_FORMAT_YUY2) continue;
         if (want_w <= 0 || want_h <= 0) {
             if (fallback < 0) fallback = i;
             if (fi->h_res == 640 && fi->v_res == 480) fallback_640 = i;
@@ -512,13 +561,12 @@ static int pick_native(bool mjpeg_only, int want_w, int want_h)
         }
         if (fi->h_res == want_w && fi->v_res == want_h) return i;   /* 原生精确优先 */
         int kx, ky, x0, y0;
-        /* 直通不解码 → 必须原生精确；重编码允许缩放到不大于原生的目标 */
-        if (!mjpeg_only && scalable < 0 &&
+        if (scalable_ok && scalable < 0 &&
             plan_virtual(fi->h_res, fi->v_res, want_w, want_h, &kx, &ky, &x0, &y0)) {
             scalable = i;
         }
     }
-    if (fallback_640 >= 0) return fallback_640;
+    if (fallback_640 >= 0 && (want_w <= 0 || want_h <= 0)) return fallback_640;
     if (fallback >= 0 && (want_w <= 0 || want_h <= 0)) return fallback;
     return scalable;
 }
@@ -654,7 +702,19 @@ static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
                         TAG, "get_frame_list idx=%u", stream_idx);
     s_u.frame_info_n = cap;
 
-    int idx = pick_native(passthrough, s_u.req_w, s_u.req_h);
+    /* 重编码优先 MJPEG 档（硬解码后重编码，帧率不受 YUY2 档 10fps 描述符限制；
+     * 摄像头无 MJPEG 档时回退 YUY2）。直通仅 MJPEG 原生精确 */
+    int idx;
+    bool src_mjpeg;
+    if (passthrough) {
+        idx = pick_native(true, s_u.req_w, s_u.req_h, false);
+        src_mjpeg = true;
+    } else if ((idx = pick_native(true, s_u.req_w, s_u.req_h, true)) >= 0) {
+        src_mjpeg = true;
+    } else {
+        idx = pick_native(false, s_u.req_w, s_u.req_h, true);
+        src_mjpeg = false;
+    }
     if (idx < 0) {
         ESP_LOGE(TAG, "%s 模式下不支持 %dx%d（见档位列表）",
                  passthrough ? "passthrough" : "reencode", s_u.req_w, s_u.req_h);
@@ -665,6 +725,12 @@ static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
     /* 输出分辨率：直通=原生；重编码=请求值（默认原生），由 plan_virtual 保证可行 */
     int out_w = passthrough ? fi->h_res : (s_u.req_w ? s_u.req_w : fi->h_res);
     int out_h = passthrough ? fi->v_res : (s_u.req_h ? s_u.req_h : fi->v_res);
+    /* native 尺寸先于 encoder_open 落位（解码输出缓冲按 native 分配） */
+    s_u.w = fi->h_res;
+    s_u.h = fi->v_res;
+    s_u.out_w = out_w;
+    s_u.out_h = out_h;
+    s_u.dec_src_mjpeg = !passthrough && src_mjpeg;
 
     uvc_host_stream_config_t cfg = {
         .event_cb = stream_event_cb,
@@ -781,7 +847,33 @@ static void worker_task(void *arg)
             s_u.stats.out_bytes += f->data_len;
             ret_frame(h, f);
         } else {
-            /* ★ 模式 B：YUY2 → 硬件 JPEG 重编码（quality 可控，与 DVP 同档可比） */
+            /* ★ 模式 B：重编码（quality 可控，与 DVP 同档可比）。
+             * 输入两类：MJPEG 档（硬件解码→UYVY，帧率不受 YUY2 档 10fps 描述符限制）
+             * / YUY2 档（直接字节序交换，回退路径） */
+            const uint8_t *src = f->data;
+            if (s_u.dec_src_mjpeg) {
+                if (!s_u.dec || !s_u.dec_out) {
+                    s_u.stats.cap_drops++;   /* 解码器未就绪（开流竞态）：丢弃 */
+                    ret_frame(h, f);
+                    s_u.worker_busy = false;
+                    continue;
+                }
+                jpeg_decode_cfg_t dc = { .output_format = JPEG_DECODE_OUT_FORMAT_YUV422 };
+                uint32_t dec_len = 0;
+                esp_err_t derr = jpeg_decoder_process(s_u.dec, &dc, f->data, f->data_len,
+                                                      s_u.dec_out, s_u.dec_out_len, &dec_len);
+                if (derr != ESP_OK) {
+                    static uint32_t dec_err;
+                    if (++dec_err % 30 == 1)
+                        ESP_LOGW(TAG, "jpeg decode 失败 %s（len=%u）— 丢帧",
+                                 esp_err_to_name(derr), (unsigned)f->data_len);
+                    s_u.stats.cap_drops++;
+                    ret_frame(h, f);
+                    s_u.worker_busy = false;
+                    continue;
+                }
+                src = s_u.dec_out;
+            }
             int idx;
             if (!h || xQueueReceive(s_u.enc_free_in, &idx, 0) != pdTRUE) {
                 s_u.stats.cap_drops++;   /* 编码器忙：丢帧保时延 */
@@ -792,8 +884,9 @@ static void worker_task(void *arg)
             int kx, ky, x0, y0;
             plan_virtual(s_u.w, s_u.h, s_u.out_w, s_u.out_h, &kx, &ky, &x0, &y0);
             size_t out_bytes = MIN((size_t)s_u.out_w * s_u.out_h * 2, s_u.enc_in[idx].length);
-            fill_encoder_input(s_u.enc_in[idx].start, f->data,
-                               s_u.w, s_u.h, s_u.out_w, s_u.out_h, kx, ky, x0, y0, t_arr);
+            fill_encoder_input(s_u.enc_in[idx].start, src,
+                               s_u.w, s_u.h, s_u.out_w, s_u.out_h, kx, ky, x0, y0,
+                               !s_u.dec_src_mjpeg, t_arr);   /* YUY2 需交换；解码输出已是 UYVY */
             struct v4l2_buffer vb = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_USERPTR,
                                       .index = idx, .bytesused = out_bytes };
             vb.m.userptr = (unsigned long)s_u.enc_in[idx].start;
@@ -1093,7 +1186,8 @@ void source_usb_set_overlay(bool on)
 {
     /* 直通模式无法叠加（不解码）；仅重编码模式生效，UI 提示 */
     if (on && s_u.mode == USB_MODE_PASSTHROUGH) {
-        ESP_LOGW(TAG, "passthrough 模式不解码，无法叠加毫秒计数器；请切换 reencode 模式做光学闭环");
+        ESP_LOGW(TAG, "passthrough 模式不解码，无法叠加毫秒计数器；已由配置层自动切 reencode"
+                     "（重编码走 MJPEG 档硬解码，帧率不受 YUY2 10fps 档限制）");
     }
     s_u.overlay = on;
 }
@@ -1117,9 +1211,12 @@ src_info_t *source_usb_info(void)
     info.nominal_fps = 0;
     strlcpy(info.sensor_name, s_u.dev_name[0] ? s_u.dev_name : "USB-UVC", sizeof(info.sensor_name));
     strlcpy(info.usb_device_name, s_u.dev_name, sizeof(info.usb_device_name));
-    strlcpy(info.pix_fmt_str, s_u.mode == USB_MODE_PASSTHROUGH ? "JPEG" : "YUY2→JPEG", sizeof(info.pix_fmt_str));
+    strlcpy(info.pix_fmt_str,
+            s_u.mode == USB_MODE_PASSTHROUGH ? "JPEG" :
+            s_u.dec_src_mjpeg ? "MJPEG→解码→JPEG" : "YUY2→JPEG", sizeof(info.pix_fmt_str));
     snprintf(info.fmt_name, sizeof(info.fmt_name), "%s%s%ux%u",
-             s_u.mode == USB_MODE_PASSTHROUGH ? "MJPEG直通" : "YUY2重编码",
+             s_u.mode == USB_MODE_PASSTHROUGH ? "MJPEG直通" :
+             s_u.dec_src_mjpeg ? "MJPEG解码重编码" : "YUY2重编码",
              info.scaled ? "缩放" : "", info.w, info.h);
     return &info;
 }
