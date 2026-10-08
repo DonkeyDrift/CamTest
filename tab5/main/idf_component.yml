@@ -1,0 +1,18 @@
+## CamTest Tab5 组件依赖（IDF v6.1 + esp32p4）
+dependencies:
+  # USB UVC host 驱动：与 S31 工程同版本段（2.5.2，quirks 与三层看门狗均围绕它设计）
+  espressif/usb_host_uvc: "~2.5"
+  # USB Host 库（IDF v6 起移入组件仓库）
+  espressif/usb: "^1"
+  # IDF v6 起 cJSON 与 mDNS 移入组件仓库
+  espressif/cjson: "^1.7"
+  espressif/mdns: "^1.4"
+  # ESP32-P4 硬件 H.264 编码器（UYVY 输入，baseline，1080p>30fps）
+  espressif/esp_h264: "~1.4"
+  # Wi-Fi 走 C6 协处理器：esp_hosted（esp_wifi_remote 已内置于 IDF v6.1，
+  # 后端库默认选择 ESP-HOSTED，无需另装）
+  espressif/esp_hosted: "~3.0"
+  # 板级电源使能：双 PI4IOE5V6408 IO 扩展器（USB VBUS / C6 电源 / 相机电源）
+  espressif/esp_io_expander: "*"
+  espressif/esp_io_expander_pi4ioe5v6408: "*"
+  idf: ">=6.1"

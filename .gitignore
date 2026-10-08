@@ -72,3 +72,11 @@ managed_components/
 sdkconfig
 sdkconfig.old
 dependencies.lock.tmp
+
+# IDF build artifacts (Tab5 subproject)
+tab5/build/
+tab5/sdkconfig
+tab5/sdkconfig.old
+tab5/dependencies.lock
+tab5/managed_components/
+tab5/version.txt

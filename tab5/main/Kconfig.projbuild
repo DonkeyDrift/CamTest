@@ -1,0 +1,81 @@
+menu "CamTest Tab5 Configuration"
+
+    choice CAMTEST_WIFI_MODE
+        prompt "Wi-Fi 默认模式"
+        default CAMTEST_WIFI_MODE_STA
+        help
+            STA = 连接指定路由器；SoftAP = 板子自开热点（PC 直连）。
+            运行时可通过 /api/config 切换。
+        config CAMTEST_WIFI_MODE_STA
+            bool "STA（连接路由器）"
+        config CAMTEST_WIFI_MODE_AP
+            bool "SoftAP（板子开热点）"
+    endchoice
+
+    config CAMTEST_WIFI_STA_SSID
+        string "STA 模式 SSID"
+        default "HUAWEI-DKC"
+
+    config CAMTEST_WIFI_STA_PASSWORD
+        string "STA 模式密码"
+        default "dkc@2026"
+
+    config CAMTEST_WIFI_AP_SSID
+        string "SoftAP SSID"
+        default "tab5-cam"
+
+    config CAMTEST_WIFI_AP_PASSWORD
+        string "SoftAP 密码（>=8 位，空则开放）"
+        default "tab5cam1234"
+
+    config CAMTEST_MDNS_HOSTNAME
+        string "mDNS 主机名"
+        default "tab5-cam"
+
+    config CAMTEST_MAX_STREAM_CLIENTS
+        int "并发流客户端上限（HTTP+WS 合计）"
+        default 8
+        range 1 8
+
+    config CAMTEST_ENABLE_UDP
+        bool "启用 UDP 分片推送（探索时延下限，需 tools/udp_receiver.py）"
+        default n
+
+    config CAMTEST_UDP_PORT
+        int "UDP 服务端口"
+        default 9100
+
+    config CAMTEST_STREAM_PORT
+        int "流服务 TCP 端口（/stream 与 /ws）"
+        default 81
+
+    config CAMTEST_ENABLE_USB
+        bool "启用 USB UVC 摄像头采集通路（usb_host_uvc 原生 API，热插拔）"
+        default y
+
+    choice CAMTEST_USB_DEFAULT_MODE
+        prompt "USB 摄像头默认工作模式"
+        default CAMTEST_USB_DEFAULT_MODE_H264
+        help
+            h264 = MJPEG→硬件解码→P4 硬件 H.264（推荐：码率小、可叠加 OSD）；
+            passthrough = MJPEG 直通（帧率上限最高，码率大，画质不可控）；
+            reencode = MJPEG→硬件解码→P4 硬件 JPEG（保留 S31 语义，供标定/对比）。
+        config CAMTEST_USB_DEFAULT_MODE_H264
+            bool "h264（硬件 H.264，默认）"
+        config CAMTEST_USB_DEFAULT_MODE_PASSTHROUGH
+            bool "passthrough（MJPEG 直通）"
+        config CAMTEST_USB_DEFAULT_MODE_REENCODE
+            bool "reencode（硬件 JPEG 重编码）"
+    endchoice
+
+    config CAMTEST_H264_BITRATE_KBPS
+        int "H.264 默认目标码率（kbps）"
+        default 2500
+        range 200 20000
+
+    config CAMTEST_H264_GOP
+        int "H.264 GOP（IDR 间隔帧数；浏览器中途加入需等到 IDR）"
+        default 30
+        range 1 255
+
+endmenu

@@ -1,0 +1,394 @@
+/* stream_server.c — 见 stream_server.h
+ *
+ * WS 二进制协议 v2（向后兼容 S31 页面协议）：
+ *   36B 小端应用头 + payload：
+ *     [0:4)  magic："MJP1"=JPEG（S31 兼容）；"AVC1"=H.264 Annex-B access unit
+ *     [4:8)  fid
+ *     [8:16) t_capture_us
+ *     [16:24) t_encode_done_us
+ *     [24:26) w   [26:28) h
+ *     [28]   quality（H264 恒 0）
+ *     [29]   source（0=dvp 1=usb）
+ *     [30:34) payload len
+ *     [34]   key（H264：1=IDR；JPEG 恒 0）   ← v2 新增
+ *     [35]   保留
+ *   RFC6455 多字节长度为网络序大端（S31 坑 #1：小端写法消息边界失步）。
+ */
+#include "stream_server.h"
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <lwip/sockets.h>
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_check.h"
+#include "esp_random.h"
+#include "psa/crypto.h"   /* IDF v6：mbedtls 公共 SHA1 API 移入 PSA */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "frame_ring.h"
+#include "source_if.h"
+#include "sdkconfig.h"
+
+static const char *TAG = "stream_srv";
+
+#define BOUNDARY "framecamtest1234567890"
+#define MAX_CLIENTS CONFIG_CAMTEST_MAX_STREAM_CLIENTS
+#define SND_TIMEOUT_MS 4000
+
+typedef struct {
+    int fd;
+    bool in_use;
+    char type[8];
+    char ip[16];
+    uint32_t frames;
+    uint64_t bytes;
+    uint64_t win_start_us;
+    stream_client_stat_t pub;
+} client_t;
+
+static client_t s_cli[MAX_CLIENTS];
+static SemaphoreHandle_t s_cli_lock;
+static volatile uint32_t s_total_frames, s_total_bytes;
+static int s_listen_fd = -1;
+static uint16_t s_port;
+
+/* ---------------- 客户端管理 ---------------- */
+static client_t *client_alloc(void)
+{
+    xSemaphoreTake(s_cli_lock, portMAX_DELAY);
+    client_t *c = NULL;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (!s_cli[i].in_use) { c = &s_cli[i]; memset(c, 0, sizeof(*c)); c->in_use = true; break; }
+    xSemaphoreGive(s_cli_lock);
+    return c;
+}
+static void client_free(client_t *c)
+{
+    xSemaphoreTake(s_cli_lock, portMAX_DELAY);
+    c->in_use = false;
+    xSemaphoreGive(s_cli_lock);
+}
+static void client_tick(client_t *c)
+{
+    uint64_t now = esp_timer_get_time();
+    if (now - c->win_start_us >= 1000000) {
+        float sec = (now - c->win_start_us) / 1e6;
+        c->pub.fps = c->frames / sec;
+        c->pub.mbps = c->bytes * 8 / sec / 1e6;
+        c->pub.frames += c->frames;
+        c->frames = 0; c->bytes = 0; c->win_start_us = now;
+    }
+}
+
+/* ---------------- MJPEG 客户端 ---------------- */
+static int send_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    while (len) {
+        int n = send(fd, p, len, 0);
+        if (n <= 0) return -1;
+        p += n; len -= n;
+    }
+    return 0;
+}
+
+static void mjpeg_client_task(void *arg)
+{
+    client_t *c = arg;
+    frame_ring_t *ring = src_if_ring();
+    SemaphoreHandle_t notify = xSemaphoreCreateBinary();
+    uint32_t last_fid = frame_ring_last_fid(ring);
+    char hdr[512];
+
+    snprintf(hdr, sizeof(hdr),
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Type: multipart/x-mixed-replace; boundary=" BOUNDARY "\r\n"
+             "Access-Control-Allow-Origin: *\r\n"
+             "Cache-Control: no-store\r\n"
+             "\r\n");
+    if (send_all(c->fd, hdr, strlen(hdr)) != 0) goto done;
+
+    frame_ring_register(ring, notify);
+    ESP_LOGI(TAG, "mjpeg client %s connected", c->ip);
+    for (;;) {
+        xSemaphoreTake(notify, pdMS_TO_TICKS(500));
+        frame_slot_t *s = frame_ring_acquire(ring, last_fid);
+        if (!s) {
+            if (!c->in_use) break;
+            continue;
+        }
+        if (s->codec != FRAME_CODEC_JPEG) {   /* H264 帧无法走 MJPEG part */
+            frame_ring_release(ring, s);
+            continue;
+        }
+        last_fid = s->fid;
+        int n = snprintf(hdr, sizeof(hdr),
+                         "\r\n--" BOUNDARY "\r\n"
+                         "Content-Type: image/jpeg\r\n"
+                         "Content-Length: %u\r\n"
+                         "X-Frame-Id: %lu\r\n"
+                         "X-Capture-Us: %llu\r\n"
+                         "X-Encode-Us: %llu\r\n"
+                         "X-Jpeg-Len: %u\r\n"
+                         "X-Sensor: %s\r\n"
+                         "X-Res: %ux%u\r\n"
+                         "X-Quality: %u\r\n"
+                         "X-Source: %s\r\n"
+                         "X-Scaled: %u\r\n"
+                         "X-Ts-Meaning: %s\r\n"
+                         "\r\n",
+                         (unsigned)s->len, (unsigned long)s->fid,
+                         (unsigned long long)s->t_capture_us,
+                         (unsigned long long)s->t_encode_done_us,
+                         (unsigned)s->len, src_if_info()->sensor_name,
+                         s->w, s->h, s->quality,
+                         src_if_source_name((video_source_t)s->source),
+                         s->scaled,
+                         src_if_ts_meaning_name((ts_meaning_t)s->ts_meaning));
+        int rc = send_all(c->fd, hdr, n) || send_all(c->fd, s->data, s->len) ||
+                 send_all(c->fd, "\r\n", 2);
+        frame_ring_release(ring, s);
+        if (rc != 0) break;
+        c->frames++; c->bytes += s->len + n + 2;
+        s_total_frames++; s_total_bytes += s->len + n + 2;
+        client_tick(c);
+        vTaskDelay(1);
+    }
+    frame_ring_unregister(ring, notify);
+    vSemaphoreDelete(notify);
+done:
+    ESP_LOGI(TAG, "mjpeg client %s gone", c->ip);
+    close(c->fd);
+    client_free(c);
+    vTaskDelete(NULL);
+}
+
+/* ---------------- WebSocket 客户端 ---------------- */
+static void ws_send_frame(client_t *c, const frame_slot_t *s)
+{
+    bool h264 = (s->codec == FRAME_CODEC_H264);
+    uint8_t hdr[36] = {0};
+    memcpy(hdr, h264 ? "AVC1" : "MJP1", 4);
+    memcpy(hdr + 4, &s->fid, 4);
+    memcpy(hdr + 8, &s->t_capture_us, 8);
+    memcpy(hdr + 16, &s->t_encode_done_us, 8);
+    uint16_t w = s->w, h = s->h;
+    memcpy(hdr + 24, &w, 2);
+    memcpy(hdr + 26, &h, 2);
+    hdr[28] = s->quality;
+    hdr[29] = s->source;
+    uint32_t len = s->len;
+    memcpy(hdr + 30, &len, 4);
+    hdr[34] = s->key;
+    /* 两段 copy（头 + 数据）各自 send 会破坏 WS 消息边界，必须一次发出 */
+    uint8_t *msg = malloc(36 + s->len);
+    if (!msg) return;
+    memcpy(msg, hdr, 36);
+    memcpy(msg + 36, s->data, s->len);
+    /* RFC6455：多字节长度是网络序大端（S31 坑 #1） */
+    uint8_t wh[10];
+    int whn = 0;
+    wh[whn++] = 0x82;
+    size_t total = s->len + 36;
+    if (total < 126) {
+        wh[whn++] = total;
+    } else if (total < 65536) {
+        wh[whn++] = 126;
+        wh[whn++] = (uint8_t)(total >> 8);
+        wh[whn++] = (uint8_t)(total & 0xFF);
+    } else {
+        wh[whn++] = 127;
+        for (int i = 7; i >= 0; i--) wh[whn++] = (uint8_t)((uint64_t)total >> (i * 8));
+    }
+    int rc = send_all(c->fd, wh, whn) || send_all(c->fd, msg, 36 + s->len);
+    free(msg);
+    if (rc == 0) {
+        c->frames++; c->bytes += s->len + 36;
+        s_total_frames++; s_total_bytes += s->len + 36;
+        client_tick(c);
+    } else {
+        c->frames = -1; /* 标记退出 */
+    }
+    vTaskDelay(1);
+}
+
+static void ws_client_task(void *arg)
+{
+    client_t *c = arg;
+    frame_ring_t *ring = src_if_ring();
+    SemaphoreHandle_t notify = xSemaphoreCreateBinary();
+    uint32_t last_fid = frame_ring_last_fid(ring);
+    uint8_t rbuf[512];
+
+    frame_ring_register(ring, notify);
+    ESP_LOGI(TAG, "ws client %s connected", c->ip);
+    for (;;) {
+        xSemaphoreTake(notify, pdMS_TO_TICKS(500));
+        frame_slot_t *s = frame_ring_acquire(ring, last_fid);
+        if (s) {
+            last_fid = s->fid;
+            ws_send_frame(c, s);
+            frame_ring_release(ring, s);
+            if ((int)c->frames < 0) break;
+        }
+        int n = recv(c->fd, rbuf, sizeof(rbuf), MSG_DONTWAIT);
+        if (n == 0 || (n < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) break;
+        if (n >= 2 && (rbuf[0] & 0x0F) == 0x8) break;
+        if (!c->in_use) break;
+    }
+    frame_ring_unregister(ring, notify);
+    vSemaphoreDelete(notify);
+    ESP_LOGI(TAG, "ws client %s gone", c->ip);
+    close(c->fd);
+    client_free(c);
+    vTaskDelete(NULL);
+}
+
+/* WS 握手：Sec-WebSocket-Accept = base64(SHA1(key + GUID))（psa，IDF v6） */
+int ws_handshake_reply(int fd, const char *key)
+{
+    static bool psa_ready;
+    if (!psa_ready) { psa_crypto_init(); psa_ready = true; }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+    unsigned char sha[20];
+    size_t sha_len = 0;
+    if (psa_hash_compute(PSA_ALG_SHA_1, (const uint8_t *)buf, strlen(buf),
+                         sha, sizeof(sha), &sha_len) != PSA_SUCCESS || sha_len != 20) {
+        return -1;
+    }
+    static const char *b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char out[32];
+    int o = 0;
+    for (int i = 0; i < 20; i += 3) {
+        uint32_t v = sha[i] << 16 | (i + 1 < 20 ? sha[i + 1] << 8 : 0) | (i + 2 < 20 ? sha[i + 2] : 0);
+        out[o++] = b64[(v >> 18) & 63];
+        out[o++] = b64[(v >> 12) & 63];
+        out[o++] = (i + 1 < 20) ? b64[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < 20) ? b64[v & 63] : '=';
+    }
+    out[o] = 0;
+    char resp[160];
+    int n = snprintf(resp, sizeof(resp),
+                     "HTTP/1.1 101 Switching Protocols\r\n"
+                     "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                     "Sec-WebSocket-Accept: %s\r\n\r\n", out);
+    return send_all(fd, resp, n);
+}
+
+/* ---------------- accept 循环 ---------------- */
+static void accept_task(void *arg)
+{
+    while (1) {
+        struct sockaddr_in ca; socklen_t cl = sizeof(ca);
+        int fd = accept(s_listen_fd, (struct sockaddr *)&ca, &cl);
+        if (fd < 0) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+
+        client_t *c = client_alloc();
+        if (!c) {
+            const char *busy = "HTTP/1.1 503 Busy\r\nConnection: close\r\n\r\n";
+            send(fd, busy, strlen(busy), 0);
+            close(fd);
+            continue;
+        }
+        struct timeval tv = { .tv_sec = SND_TIMEOUT_MS / 1000, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        int nd = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+        c->fd = fd;
+        strlcpy(c->ip, inet_ntoa(ca.sin_addr), sizeof(c->ip));
+        strlcpy(c->pub.ip, c->ip, sizeof(c->pub.ip));
+        c->win_start_us = esp_timer_get_time();
+
+        char req[256];
+        int n = 0, r;
+        while (n < (int)sizeof(req) - 1 && (r = recv(fd, req + n, 1, 0)) == 1) {
+            if (req[n] == '\n') break;
+            n++;
+        }
+        req[n] = 0;
+        char *key_hdr = strstr(req, "Sec-WebSocket-Key");
+        if (strncmp(req, "GET /ws", 7) == 0 || key_hdr) {
+            char rest[512] = {0};
+            int total = 0;
+            fd_set rs; struct timeval t0 = { .tv_sec = 1, .tv_usec = 0 };
+            FD_ZERO(&rs); FD_SET(fd, &rs);
+            while (select(fd + 1, &rs, NULL, NULL, &t0) > 0) {
+                r = recv(fd, rest + total, sizeof(rest) - 1 - total, 0);
+                if (r <= 0) break;
+                total += r;
+                if (strstr(rest, "\r\n\r\n")) break;
+                FD_ZERO(&rs); FD_SET(fd, &rs);
+            }
+            rest[total] = 0;
+            char *key = strstr(rest, "Sec-WebSocket-Key:");
+            if (!key) key = strstr(rest, "sec-websocket-key:");
+            if (key && strncmp(req, "GET /ws", 7) == 0) {
+                key += strlen("Sec-WebSocket-Key:");
+                while (*key == ' ') key++;
+                char *e = strstr(key, "\r\n");
+                if (e) *e = 0;
+                ws_handshake_reply(fd, key);
+                strlcpy(c->type, "ws", sizeof(c->type));
+                strlcpy(c->pub.type, "ws", sizeof(c->pub.type));
+                if (xTaskCreatePinnedToCore(ws_client_task, "ws_cli", 4096, c, 6, NULL, 0) != pdPASS) {
+                    close(fd); client_free(c);
+                }
+                continue;
+            }
+            const char *bad = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+            send(fd, bad, strlen(bad), 0);
+            close(fd); client_free(c);
+            continue;
+        }
+        if (strncmp(req, "GET /stream", 11) == 0) {
+            strlcpy(c->type, "mjpeg", sizeof(c->type));
+            strlcpy(c->pub.type, "mjpeg", sizeof(c->pub.type));
+            if (xTaskCreatePinnedToCore(mjpeg_client_task, "mjp_cli", 4096, c, 6, NULL, 0) != pdPASS) {
+                close(fd); client_free(c);
+            }
+            continue;
+        }
+        const char *nf = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+        send(fd, nf, strlen(nf), 0);
+        close(fd); client_free(c);
+    }
+}
+
+esp_err_t stream_server_start(uint16_t port)
+{
+    s_port = port;
+    s_cli_lock = xSemaphoreCreateMutex();
+    s_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int yes = 1;
+    setsockopt(s_listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY),
+                                .sin_port = htons(port) };
+    ESP_RETURN_ON_ERROR(bind(s_listen_fd, (struct sockaddr *)&addr, sizeof(addr)), TAG, "bind");
+    ESP_RETURN_ON_ERROR(listen(s_listen_fd, MAX_CLIENTS), TAG, "listen");
+    if (xTaskCreatePinnedToCore(accept_task, "stream_acc", 4096, NULL, 5, NULL, 0) != pdPASS)
+        return ESP_FAIL;
+    ESP_LOGI(TAG, "stream server on :%u (/stream, /ws)", port);
+    return ESP_OK;
+}
+
+int stream_server_get_clients(stream_client_stat_t *out, int max)
+{
+    int n = 0;
+    xSemaphoreTake(s_cli_lock, portMAX_DELAY);
+    for (int i = 0; i < MAX_CLIENTS && n < max; i++) {
+        if (s_cli[i].in_use) out[n++] = s_cli[i].pub;
+    }
+    xSemaphoreGive(s_cli_lock);
+    return n;
+}
+
+uint32_t stream_server_frames_sent(void) { return s_total_frames; }
+uint32_t stream_server_bytes_sent(void) { return s_total_bytes; }
+
+esp_err_t udp_push_start(uint16_t port)
+{
+    (void)port;   /* Tab5 版暂不启用 UDP 分片（CONFIG_CAMTEST_ENABLE_UDP 默认关） */
+    return ESP_OK;
+}

@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<!--
+  CamTest Web UI — M5Stack Tab5 (ESP32-P4 + C6) 硬件 H.264 图传性能闭环
+  纯原生 HTML/CSS/JS，单文件离线内嵌于固件（无 CDN / 无 npm 依赖）。
+  移植自 S31 版，新增：
+    - H.264 播放（WebCodecs VideoDecoder，Annex-B，optimizeForLatency，等 IDR 起播）
+    - WS 协议 v2：magic "AVC1"=H264（byte34=关键帧标志）；"MJP1"=JPEG（S31 兼容）
+    - H264 码率控制（h264_kbps / target_mbps governor）
+  与固件接口：
+    GET  /api/sync /api/status   POST /api/config   GET /stream   WS :81/ws
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CamTest · Tab5 硬件 H.264 图传</title>
+<style>
+:root{
+  --bg:#0d1117;--panel:#161b22;--panel2:#1c2330;--line:#2d333b;--txt:#e6edf3;
+  --dim:#8b949e;--acc:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149;--mag:#bc8cff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:14px/1.45 -apple-system,"PingFang SC","Microsoft YaHei",Segoe UI,Roboto,sans-serif;padding:10px 14px 30px}
+h1{font-size:17px;font-weight:600}
+a{color:var(--acc);text-decoration:none}
+code{background:#21262d;border-radius:4px;padding:1px 5px;font-size:12px}
+header{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding:6px 0 10px;border-bottom:1px solid var(--line)}
+.badge{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--dim);white-space:nowrap}
+.badge b{color:var(--txt);font-weight:600}
+.badge.ok b{color:var(--ok)}.badge.warn b{color:var(--warn)}.badge.err b{color:var(--err)}
+.grid{display:grid;grid-template-columns:minmax(420px,1.35fr) minmax(330px,1fr);gap:14px;margin-top:12px}
+@media(max-width:960px){.grid{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+.card h2{font-size:13px;font-weight:600;color:var(--dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:.4px}
+#videoWrap{position:relative;background:#000;border-radius:8px;overflow:hidden}
+#video{display:block;width:100%;height:auto;max-height:52vh;object-fit:contain}
+#videoOv{position:absolute;left:8px;top:8px;font:600 12px/1.3 ui-monospace,Menlo,monospace;color:#7ee787;text-shadow:0 1px 2px #000;pointer-events:none}
+#videoOv .r{color:#ffa657}
+#streamHint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:13px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:13px}
+.kv .k{color:var(--dim)}
+.kv .v{text-align:right;font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,monospace}
+.kv .v small{color:var(--dim)}
+.big{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:6px 0 2px}
+.big>div{background:var(--panel2);border-radius:8px;padding:6px 8px;text-align:center}
+.big .n{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,monospace}
+.big .l{font-size:11px;color:var(--dim)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:4px 6px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--dim);font-weight:600;position:sticky;top:0;background:var(--panel)}
+.scroll{max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+button{background:#21262d;color:var(--txt);border:1px solid #363b42;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer}
+button:hover{background:#30363d}
+button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
+select,input[type=range],input[type=text],input[type=number]{background:#0d1117;color:var(--txt);border:1px solid #363b42;border-radius:6px;padding:4px 6px;font-size:13px}
+label.ctl{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:5px 0;font-size:13px}
+label.ctl .lab{color:var(--dim)}
+#chart{width:100%;height:150px;display:block}
+.note{font-size:12px;color:var(--dim);margin-top:6px}
+.tag{display:inline-block;border-radius:4px;padding:0 5px;font-size:11px;margin-left:4px}
+.tag.est{background:#3b2e12;color:var(--warn)}
+.tag.ms{background:#122a3b;color:var(--acc)}
+.tag.h264{background:#1d2f1d;color:#7ee787}
+#banner{display:none;background:#3d1417;border:1px solid #f85149;border-radius:8px;padding:8px 12px;margin-top:10px;color:#ffd6d6;font-size:13px}
+footer{margin-top:16px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🎥 CamTest <span style="color:var(--dim);font-weight:400">Tab5 · ESP32-P4 硬件 H.264 图传</span></h1>
+  <span class="badge" id="bSource">源 <b>—</b></span>
+  <span class="badge" id="bSensor">sensor <b>—</b></span>
+  <span class="badge" id="bRes">—</span>
+  <span class="badge" id="bWifi">Wi-Fi <b>—</b></span>
+  <span class="badge" id="bRssi">RSSI <b>—</b></span>
+  <span class="badge" id="bIp"><a id="ipLink" href="/">—</a></span>
+  <span class="badge" id="bClock">clock <b>—</b></span>
+  <span class="badge" id="bUp">up <b>—</b></span>
+</header>
+
+<div id="banner"></div>
+
+<div class="grid">
+  <!-- 左列：画面 + 折线图 + 控制 -->
+  <div>
+    <div class="card">
+      <h2>实时画面 <span id="transportNote" class="tag ms">HTTP MJPEG</span><span id="codecNote" class="tag h264" style="display:none">H.264 硬件解码</span></h2>
+      <div id="videoWrap">
+        <canvas id="video"></canvas>
+        <div id="videoOv"></div>
+        <div id="streamHint">正在连接流…</div>
+      </div>
+      <div class="row2" style="margin-top:8px">
+        <div class="big">
+          <div><div class="n" id="nArrFps">–</div><div class="l">到达 FPS<br>(浏览器实测)</div></div>
+          <div><div class="n" id="nCapFps">–</div><div class="l">采集 FPS<br>(设备侧)</div></div>
+          <div><div class="n" id="nLat">–</div><div class="l">端到端时延 1s均值<br><span style="color:var(--warn)">含估算成分</span></div></div>
+        </div>
+      </div>
+      <canvas id="chart"></canvas>
+      <div class="note">折线：端到端时延 1s 均值（左轴，ms，<span style="color:#ffa657">橙=设备处理耗时(实测)</span>，<span style="color:#58a6ff">蓝=端到端(时钟同步法)</span>）；柱：到达帧率（右轴）。H.264 模式另计 <span style="color:#7ee787">解码耗时</span>（到达→上屏）。</div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>参数控制（切换会重建采集/编码链路，约 1~2 s）</h2>
+      <div class="row2">
+        <div>
+          <label class="ctl"><span class="lab">USB 模式</span><select id="cUsbMode">
+            <option value="h264">h264（MJPEG→硬解→P4 硬件 H.264 ★推荐）</option>
+            <option value="passthrough">passthrough（MJPEG 直通，最高帧率）</option>
+            <option value="reencode">reencode（MJPEG→硬解→硬件 JPEG，画质可控）</option>
+          </select></label>
+          <label class="ctl"><span class="lab">分辨率</span><select id="cRes"></select></label>
+          <label class="ctl" id="qRow"><span class="lab">JPEG 质量（reencode：0~100 越大越清晰）</span>
+            <span><input type="range" id="cQ" min="1" max="100" value="20" style="width:110px"> <b id="cQv" style="font-family:ui-monospace">20</b></span></label>
+          <label class="ctl"><span class="lab">帧率上限 fps（0=不限）</span><input type="number" id="cFps" min="0" max="120" value="0" style="width:70px"></label>
+        </div>
+        <div>
+          <label class="ctl" id="kbpsRow"><span class="lab">H.264 码率 kbps（画质·带宽权衡）</span><input type="number" id="cKbps" min="200" max="20000" step="100" value="2500" style="width:80px"></label>
+          <label class="ctl"><span class="lab">传输模式</span><select id="cTr">
+            <option value="ws">WebSocket 二进制（H264 必须）</option>
+            <option value="http">HTTP MJPEG（仅 passthrough/reencode）</option>
+          </select></label>
+          <label class="ctl"><span class="lab">画面叠加设备毫秒计数器（光学校验）</span><input type="checkbox" id="cOv"></label>
+          <label class="ctl"><span class="lab">目标码率上限 Mbps（0=关闭自适应降码率）</span><input type="number" id="cBr" min="0" max="50" step="0.5" value="0" style="width:70px"></label>
+        </div>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button class="primary" id="bApply">应用配置</button>
+        <a href="/overlay" target="_blank">光学闭环校验说明 →</a>
+        <span class="note" id="cfgMsg"></span>
+      </div>
+      <div class="note">⚠️ Tab5 Type-A 主机口为全速 USB（12 Mbps）：UVC 摄像头码率天花板 ≈1 MB/s，高分辨率档帧率受限属硬件约束。H.264 模式以最低码率换取全速链路下的最高可行帧率。</div>
+    </div>
+  </div>
+
+  <!-- 右列：指标 -->
+  <div>
+    <div class="card">
+      <h2>时延拆分（ms）</h2>
+      <div class="kv">
+        <span class="k">当前值</span><span class="v" id="lNow">–</span>
+        <span class="k">1 s 均值</span><span class="v" id="l1s">–</span>
+        <span class="k">5 s 均值</span><span class="v" id="l5s">–</span>
+        <span class="k">P95 (5 s)</span><span class="v" id="lP95">–</span>
+        <span class="k">最大 (5 s)</span><span class="v" id="lMax">–</span>
+        <span class="k">抖动 σ (5 s)</span><span class="v" id="lStd">–</span>
+      </div>
+      <div id="latSeg" style="margin-top:6px">
+        <div class="kv">
+          <span class="k">① 摄像头内部 <span class="tag est">估算</span></span><span class="v" id="segCam">–</span>
+          <span class="k">② ESP32 处理 <span style="color:var(--ok)">精确</span></span><span class="v" id="segEsp">–</span>
+          <span class="k">③ 网络+浏览器 <span class="tag est">估算</span></span><span class="v" id="segNet">–</span>
+          <span class="k">浏览器解码（H264）</span><span class="v" id="segDec">–</span>
+          <span class="k">时钟同步质量</span><span class="v" id="segSync">–</span>
+        </div>
+        <div class="note">USB 源：t_capture=帧完整到达 ESP32 时刻。①=曝光→到达（不可直接测，需光学标定）；②=到达→编码完成（精确，<code>enc−cap</code>）；③=端到端−①−②；解码=WebCodecs 出帧耗时（H264 模式）。③为负=时钟同步偏差非真实负时延。</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>帧率 / 带宽</h2>
+      <div class="kv">
+        <span class="k">采集 FPS（设备）</span><span class="v" id="fCap">–</span>
+        <span class="k">编码 FPS（设备）</span><span class="v" id="fEnc">–</span>
+        <span class="k">发送 FPS（设备→socket）</span><span class="v" id="fSend">–</span>
+        <span class="k">到达 FPS（浏览器 1s/5s）</span><span class="v" id="fArr">–</span>
+        <span class="k">目标 FPS</span><span class="v" id="fTgt">–</span>
+        <span class="k">单帧均值</span><span class="v" id="bAvg">–</span>
+        <span class="k">瞬时码率</span><span class="v" id="bNow">–</span>
+        <span class="k">5 s 平均码率</span><span class="v" id="b5s">–</span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px" id="usbCard">
+      <h2>USB 摄像头（UVC）</h2>
+      <div class="kv">
+        <span class="k">状态 / 设备</span><span class="v" id="uState">–</span>
+        <span class="k">掉线计数</span><span class="v" id="uDisc">–</span>
+        <span class="k">内部固有延迟（标定值）</span><span class="v" id="uInh">未标定</span>
+      </div>
+      <div class="row2" style="margin-top:6px">
+        <label class="ctl"><span class="lab">标定值 ms（光学闭环实测后填入；负数=清除标定）</span>
+          <span><input type="number" id="cInh" step="0.1" style="width:70px"> <button id="bInh" style="padding:3px 8px">写入</button></span></label>
+        <div class="note">三层看门狗已内置：帧停滞 5s→重开、打开失败 60s→重启、流冻结 20s→重启，黑屏 ≈67s 自愈。</div>
+      </div>
+      <div style="margin-top:8px;border-top:1px solid #21262d;padding-top:8px">
+        <label class="ctl" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="cCalTimer">
+          <span class="lab">显示标定毫秒计时器（放进摄像头视野，供拍摄）</span></label>
+        <div id="calTimer" style="display:none;font:700 44px/1.15 ui-monospace,monospace;color:#fff;background:#000;padding:10px 16px;border-radius:8px;margin-top:6px;text-align:center;letter-spacing:2px">0.000</div>
+        <div class="row2" style="margin-top:6px">
+          <input type="number" id="calC" step="0.001" placeholder="照片里设备计数 c（秒）" style="flex:1;min-width:0">
+          <input type="number" id="calS" step="0.001" placeholder="照片里计时器读数 s（秒）" style="flex:1;min-width:0">
+          <button id="bCalAdd" style="padding:4px 10px;white-space:nowrap">＋记录样本</button>
+        </div>
+        <div class="note" id="calOut">拍 ≥10 张：照片里【画面内】的计时器读数和设备计数各记一次。① = c − s − clock offset（自动扣纪元差）。叠加开启时设备自动切到可解码模式。</div>
+        <button id="bCalWrite" style="display:none;margin-top:4px;padding:4px 12px">把均值写入设备（<span id="calN">0</span> 样本）</button>
+      </div>
+      <div class="scroll" style="max-height:150px;margin-top:6px"><table id="tTiers"><thead><tr><th>格式</th><th>分辨率</th><th>标称帧率</th><th>来源</th></tr></thead><tbody><tr><td colspan="4" style="text-align:center;color:var(--dim)">未发现设备</td></tr></tbody></table></div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>设备资源（设备侧实测）</h2>
+      <div class="kv">
+        <span class="k">CPU0 / CPU1 占用</span><span class="v" id="rCpu">–</span>
+        <span class="k">空闲堆 / 最低水位</span><span class="v" id="rHeap">–</span>
+        <span class="k">PSRAM 空闲 / 最低水位</span><span class="v" id="rPs">–</span>
+        <span class="k">采集丢帧 / 编码丢帧</span><span class="v" id="rDrop">–</span>
+        <span class="k">H.264 码率（当前目标）</span><span class="v" id="rKbps">–</span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>并发客户端（设备侧统计）</h2>
+      <div class="scroll" style="max-height:120px"><table id="tClients"><thead><tr><th>类型</th><th>来源</th><th>发送 FPS</th><th>码率</th></tr></thead><tbody><tr><td colspan="4" style="text-align:center;color:var(--dim)">—</td></tr></tbody></table></div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  指标可信度：<b style="color:var(--ok)">设备侧精确实测</b>（采集/编码 FPS、处理耗时、码率、CPU、内存）；
+  <b style="color:var(--acc)">时钟同步法</b>（端到端时延，可被光学闭环校验）；浏览器到达 FPS 为浏览器侧精确实测。
+  设备时间一律 <code>esp_timer_get_time()</code> 单调钟。
+</footer>
+
+<script>
+"use strict";
+/* ============================== 全局状态 ============================== */
+const S = {
+  offsetUs: null, rttUs: null, syncCount: 0,
+  frames: [], secBuckets: [],
+  lastFid: 0, frameCount: 0,
+  status: null, supportedRes: [],
+  transport: "ws", ws: null,
+  chartData: [],
+  codec: "h264",           /* 当前帧编码：h264/jpeg */
+};
+const $ = id => document.getElementById(id);
+function fmtB(b){ if(b>=1048576) return (b/1048576).toFixed(2)+" MB"; if(b>=1024) return (b/1024).toFixed(1)+" kB"; return b+" B"; }
+function fmtN(v,d=1){ return (v==null||isNaN(v))?"–":(+v).toFixed(d); }
+function banner(msg){ const b=$("banner"); if(!msg){b.style.display="none";return;} b.style.display="block"; b.textContent=msg; }
+
+/* ============================== 时钟同步（Christian + P85 窗口） ============================== */
+async function syncClock(){
+  const probes=[];
+  for(let i=0;i<8;i++){
+    const t0=Math.round((performance.timeOrigin+performance.now())*1000);
+    try{
+      const r=await fetch("/api/sync?t_client="+t0,{cache:"no-store"});
+      const t1=Math.round((performance.timeOrigin+performance.now())*1000);
+      const j=await r.json();
+      if(j.t_dev_us!=null){
+        const rtt=t1-t0;
+        probes.push({rtt, off:j.t_dev_us-(t0+rtt/2)});
+      }
+    }catch(e){}
+    await new Promise(r=>setTimeout(r,50+Math.random()*40));
+  }
+  if(!probes.length) return;
+  /* 流帧持续挤占空口 → sync 响应被排队延迟 D，off 被拉低 D/2（S31 实录 #13）。
+   * 真实 offset ≈ 滚动 120s 窗口 P85 高分位（NTP huff-n-puff 思路） */
+  const now=performance.timeOrigin+performance.now();
+  S.syncHist=S.syncHist||[];
+  probes.forEach(p=>S.syncHist.push({t:now,...p}));
+  while(S.syncHist.length&&S.syncHist[0].t<now-120e3) S.syncHist.shift();
+  let off;
+  if(S.syncHist.length>=12){
+    const offs=S.syncHist.map(p=>p.off).sort((a,b)=>a-b);
+    off=offs[Math.min(offs.length-1,Math.floor(offs.length*0.85))];
+  }else{
+    probes.sort((a,b)=>a.rtt-b.rtt);
+    const best=probes.slice(0,3).map(p=>p.off).sort((a,b)=>a-b);
+    off=best[Math.floor(best.length/2)];
+  }
+  S.offsetUs=off;
+  S.rttUs=Math.min(...S.syncHist.map(p=>p.rtt));
+  S.syncCount++;
+  const b=$("bClock");
+  b.innerHTML=`clock <b>offset ${fmtN(S.offsetUs/1000,1)}ms · rtt ${fmtN(S.rttUs/1000,1)}ms · #${S.syncCount}（窗口${S.syncHist.length}）</b>`;
+  b.className="badge "+(S.rttUs<50000?"ok":S.rttUs<150000?"warn":"err");
+}
+
+/* ============================== H.264 WebCodecs 播放器 ==============================
+ * 设备侧 esp_h264 输出 Annex-B access unit（IDR 自动前置 SPS/PPS）。
+ * 无 description → WebCodecs 按 Annex-B 解析。optimizeForLatency 逐帧出图不等缓冲。
+ * 起播/解码器重建后必须等 IDR（key=1）才 feed delta，否则持续 ReferenceMissing。 */
+const V = { dec:null, w:0, h:0, needKey:true, decFrames:0, decErrs:0, latSum:0, lastDispUs:0 };
+function vdecReset(){
+  if(V.dec){ try{V.dec.close();}catch(e){} }
+  V.dec=null; V.w=0; V.h=0; V.needKey=true;
+}
+function vdecEnsure(w,h){
+  if(V.dec && V.w===w && V.h===h && V.dec.state==="configured") return true;
+  vdecReset();
+  if(!("VideoDecoder" in window)) return false;
+  try{
+    V.dec=new VideoDecoder({
+      output:vf=>{
+        V.decFrames++;
+        const nowUs=performance.timeOrigin+performance.now()*1000;
+        if(V.lastStampUs) V.latSum+=nowUs-V.lastStampUs;
+        const cv=$("video");
+        if(cv.width!==vf.displayWidth||cv.height!==vf.displayHeight){cv.width=vf.displayWidth;cv.height=vf.displayHeight;}
+        cv.getContext("2d").drawImage(vf,0,0);
+        vf.close();
+        if(S.frames.length){
+          /* 解码完成的时刻才是"上屏时刻"：修正最后一帧的时延与解码耗时 */
+          const f=S.frames[S.frames.length-1];
+          if(!f.decoded){ f.decoded=true; f.lat=nowUs-f.capDevUs+S.offsetUs; f.decMs=(nowUs-V.lastStampUs)/1000; }
+        }
+      },
+      error:e=>{ V.decErrs++; console.warn("vdec",e); vdecReset(); }
+    });
+    V.dec.configure({codec:"avc1.42001f", optimizeForLatency:true});
+    V.w=w; V.h=h; V.needKey=true;
+    return true;
+  }catch(e){ console.warn("vdec cfg",e); return false; }
+}
+function feedH264(meta, au, arriveUs){
+  if(!vdecEnsure(meta.w,meta.h)){ banner("此浏览器不支持 WebCodecs，请用 Chrome/Edge，或切换 passthrough+HTTP 模式"); return; }
+  if(V.dec.state!=="configured") return;
+  if(V.needKey){
+    if(!meta.key) return;            /* 等 IDR 再起播（gop=30 → ≤1s） */
+    V.needKey=false;
+  }
+  V.lastStampUs=performance.timeOrigin+performance.now()*1000;
+  try{
+    V.dec.decode(new EncodedVideoChunk({type:meta.key?"key":"delta", timestamp:arriveUs/1000, data:au}));
+  }catch(e){ V.decErrs++; vdecReset(); }
+}
+
+/* ============================== WebSocket 传输（协议 v2） ==============================
+ * 36B 小端头 + payload：
+ *   0:"MJP1"|"AVC1"  4:fid  8:cap_us  16:enc_us  24:w 26:h  28:q  29:source
+ *   30:len u32  34:key(H264 IDR=1)  35:rsv */
+let wsGen=0;
+function wsLoop(){
+  wsGen++; const g=wsGen;
+  if(S.ws){ const o=S.ws; S.ws=null; o.onclose=null; o.onerror=null; try{o.close();}catch(e){} }
+  if(S.transport!=="ws") return;
+  const host=location.hostname;
+  const ws=new WebSocket("ws://"+host+":81/ws");
+  S.ws=ws;
+  ws.binaryType="arraybuffer";
+  ws.onopen=()=>{ if(g!==wsGen) return; $("streamHint").style.display="none"; banner(null); };
+  ws.onmessage=ev=>{
+    if(g!==wsGen||!(ev.data instanceof ArrayBuffer)) return;
+    const dv=new DataView(ev.data);
+    const magic=dv.getUint32(0,true);
+    const isH264 = magic===0x31435641;   /* "AVC1" */
+    const isJpeg = magic===0x31504A4D;   /* "MJP1" */
+    if(!isH264&&!isJpeg) return;
+    const fid=dv.getUint32(4,true);
+    const cap=Number(dv.getBigUint64(8,true)), enc=Number(dv.getBigUint64(16,true));
+    const w=dv.getUint16(24,true), h=dv.getUint16(26,true);
+    const len=dv.getUint32(30,true);
+    const key=dv.getUint8(34);
+    const q=dv.getUint8(28);
+    const payload=new Uint8Array(ev.data,36,len);
+    const arriveUs=Math.round((performance.timeOrigin+performance.now())*1000);
+    S.codec=isH264?"h264":"jpeg";
+    onFrame({fid,cap,enc,len,w,h,key,q,codec:isH264?"h264":"jpeg"},payload,arriveUs);
+  };
+  ws.onclose=()=>{
+    if(g!==wsGen||S.transport!=="ws") return;
+    $("streamHint").textContent="WS 断开，1 s 后重连…";$("streamHint").style.display="flex";
+    setTimeout(()=>{ if(g===wsGen&&S.transport==="ws") wsLoop(); },1000);
+  };
+  ws.onerror=()=>{ try{ws.close();}catch(e){} };
+}
+
+/* ============================== HTTP MJPEG（passthrough/reencode 用） ============================== */
+let streamAbort=null;
+async function streamLoop(){
+  if(S.transport!=="http") return;
+  $("streamHint").style.display="flex"; banner(null);
+  while(S.transport==="http"){
+    streamAbort=new AbortController();
+    try{
+      const r=await fetch(location.protocol+"//"+location.hostname+":81/stream",{signal:streamAbort.signal,cache:"no-store"});
+      if(!r.ok||!r.body) throw new Error("stream http "+r.status);
+      $("streamHint").style.display="none";
+      const rd=r.body.getReader();
+      let buf=new Uint8Array(0), state=0, meta=null;
+      const enc=new TextDecoder();
+      for(;;){
+        const {done,value}=await rd.read();
+        if(done) break;
+        const nb=new Uint8Array(buf.length+value.length); nb.set(buf); nb.set(value,buf.length); buf=nb;
+        let progress=true;
+        while(progress){
+          progress=false;
+          if(state===0){
+            const i=buf.indexOf(13);
+            if(i<0) continue;
+            if(buf[i+1]===10){ buf=buf.subarray(i+2); state=1; progress=true; }
+            else continue;
+          }
+          if(state===1){
+            let k=-1;
+            for(let j=0;j+3<buf.length;j++){ if(buf[j]===13&&buf[j+1]===10&&buf[j+2]===13&&buf[j+3]===10){k=j;break;} }
+            if(k<0) continue;
+            meta={fid:0,cap:0,enc:0,len:0,w:0,h:0};
+            enc.decode(buf.subarray(0,k)).split("\r\n").forEach(l=>{
+              const p=l.indexOf(":"); if(p<0)return;
+              const kn=l.slice(0,p).trim().toLowerCase(), v=l.slice(p+1).trim();
+              if(kn==="content-length") meta.len=+v;
+              else if(kn==="x-frame-id") meta.fid=+v;
+              else if(kn==="x-capture-us") meta.cap=+v;
+              else if(kn==="x-encode-us") meta.enc=+v;
+              else if(kn==="x-res"){ const m=v.split("x"); meta.w=+m[0]; meta.h=+m[1]; }
+            });
+            state=2; buf=buf.subarray(k+4); progress=true;
+          }
+          if(state===2){
+            if(buf.length>=meta.len){
+              const jpeg=buf.subarray(0,meta.len);
+              const arriveUs=Math.round((performance.timeOrigin+performance.now())*1000);
+              S.codec="jpeg";
+              onFrame({fid:meta.fid,cap:meta.cap,enc:meta.enc,len:meta.len,w:meta.w,h:meta.h,key:0,codec:"jpeg"},jpeg,arriveUs);
+              buf=buf.subarray(meta.len);
+              if(buf.length>=2&&buf[0]===13&&buf[1]===10) buf=buf.subarray(2);
+              state=0; progress=true;
+            }
+          }
+        }
+      }
+    }catch(e){
+      if(e.name==="AbortError") return;
+      $("streamHint").textContent="流断开："+e+"，1 s 后重连…"; $("streamHint").style.display="flex";
+      await new Promise(r=>setTimeout(r,1000));
+    }
+  }
+}
+
+/* ============================== 帧处理与统计 ============================== */
+let drawing=false;
+function onFrame(meta, payload, arriveUs){
+  if(S.offsetUs==null) return;
+  /* 传输时延 = 到达(客户端钟) − 设备侧打点 + offset。
+   * H264 模式先记 capDevUs，等解码输出后再修正为"上屏时延"（见 vdec output 回调） */
+  const latTxUs=arriveUs - meta.cap + S.offsetUs;
+  const encUs=meta.enc - meta.cap;
+  S.frames.push({arrive:arriveUs, lat:latTxUs, latTx:latTxUs, enc:encUs, len:meta.len, fid:meta.fid,
+                 w:meta.w, h:meta.h, q:meta.q, capDevUs:meta.cap, codec:meta.codec, key:meta.key,
+                 decoded:meta.codec!=="h264", decMs:0});
+  if(S.frames.length>3000) S.frames.splice(0,1000);
+  S.lastFid=meta.fid; S.frameCount++;
+  if(meta.codec==="h264"){ feedH264(meta,payload,arriveUs); return; }  /* 画面在解码回调里画 */
+  /* JPEG：createImageBitmap 直画 */
+  if(!drawing){
+    drawing=true;
+    createImageBitmap(new Blob([payload],{type:"image/jpeg"})).then(bmp=>{
+      const cv=$("video");
+      if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height;}
+      cv.getContext("2d").drawImage(bmp,0,0); bmp.close();
+    }).catch(()=>{}).finally(()=>{drawing=false;});
+  }
+}
+function overlayText(meta, latUs, encUs){
+  const cv=$("video");
+  const qTag=meta.codec==="h264"?("H264"+(meta.key?"·IDR":"")):(meta.q>0?("q"+meta.q):"直通");
+  $("videoOv").innerHTML=`<span class="r">${meta.w}x${meta.h} ${qTag}</span> #${meta.fid} ${fmtB(meta.len)}`+
+    `<br>e2e≈${fmtN(latUs/1000,1)}ms 处理=${fmtN(encUs/1000,1)}ms`+
+    (meta.codec==="h264"?` <span style="color:#7ee787">解码=${fmtN(S.frames.length?S.frames[S.frames.length-1].decMs:0,1)}ms</span>`:"");
+}
+/* 每秒聚合 */
+function bucketSecond(){
+  const now=performance.timeOrigin+performance.now();
+  const win=S.frames.filter(f=>f.arrive>= (now-1000)*1000);
+  const b={t:now, fps:win.length, lat:0, enc:0, bits:0};
+  if(win.length){ win.forEach(f=>{b.lat+=f.lat;b.enc+=f.enc;b.bits+=f.len*8;});
+    b.lat/=win.length; b.enc/=win.length; }
+  S.secBuckets.push(b);
+  if(S.secBuckets.length>90) S.secBuckets.shift();
+}
+function pct(arr,p){ if(!arr.length)return null; const a=[...arr].sort((x,y)=>x-y); return a[Math.min(a.length-1,Math.floor(p*a.length))]; }
+function mean(a){ return a.length?a.reduce((s,v)=>s+v,0)/a.length:null; }
+function std(a){ if(a.length<2)return null; const m=mean(a); return Math.sqrt(a.reduce((s,v)=>s+(v-m)**2,0)/(a.length-1)); }
+function renderLocal(){
+  const now=(performance.timeOrigin+performance.now())*1000;
+  const w1=S.frames.filter(f=>f.arrive>=now-1e6), w5=S.frames.filter(f=>f.arrive>=now-5e6);
+  const lat1=w1.map(f=>f.lat/1000), lat5=w5.map(f=>f.lat/1000);
+  $("nArrFps").textContent=w1.length;
+  $("nLat").textContent=fmtN(mean(lat1),1);
+  $("lNow").textContent=lat1.length?fmtN(lat1[lat1.length-1],1):"–";
+  $("l1s").textContent=fmtN(mean(lat1),1);
+  $("l5s").textContent=fmtN(mean(lat5),1);
+  $("lP95").textContent=fmtN(pct(lat5,.95),1);
+  $("lMax").textContent=fmtN(lat5.length?Math.max(...lat5):null,1);
+  $("lStd").textContent=fmtN(std(lat5),1);
+  const bits5=w5.reduce((s,f)=>s+f.len*8,0);
+  $("b5s").textContent=(bits5/5/1e6).toFixed(2)+" Mbps";
+  $("fArr").textContent=w1.length+" / "+fmtN(w5.length/5,1);
+  drawChart();
+}
+function drawChart(){
+  const cv=$("chart"), dpr=window.devicePixelRatio||1;
+  const W=cv.clientWidth||600, H=150;
+  if(cv.width!==W*dpr){cv.width=W*dpr;cv.height=H*dpr;}
+  const g=cv.getContext("2d"); g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,W,H);
+  const data=S.secBuckets.slice(-60);
+  if(data.length<2){g.fillStyle="#8b949e";g.fillText("等待数据…",10,20);return;}
+  const maxLat=Math.max(30,...data.map(d=>d.lat/1000))*1.15;
+  const maxFps=Math.max(5,...data.map(d=>d.fps))*1.15;
+  const pad={l:34,r:30,t:8,b:16};
+  const X=i=>pad.l+(W-pad.l-pad.r)*i/(data.length-1);
+  const Yl=v=>H-pad.b-(H-pad.t-pad.b)*v/maxLat;
+  const Yf=v=>H-pad.b-(H-pad.t-pad.b)*v/maxFps;
+  g.strokeStyle="#21262d";g.fillStyle="#8b949e";g.font="10px sans-serif";g.lineWidth=1;
+  for(let i=0;i<=3;i++){const v=maxLat*i/3; g.beginPath();g.moveTo(pad.l,Yl(v));g.lineTo(W-pad.r,Yl(v));g.stroke(); g.fillText(v.toFixed(0),2,Yl(v)+3);}
+  g.fillText("ms",2,10);
+  g.strokeStyle="#58a6ff";g.lineWidth=1.6;g.beginPath();
+  data.forEach((d,i)=>{const y=Yl(d.lat/1000); i?g.lineTo(X(i),y):g.moveTo(X(i),y);}); g.stroke();
+  g.strokeStyle="#ffa657";g.lineWidth=1.2;g.beginPath();
+  data.forEach((d,i)=>{const y=Yl(d.enc/1000); i?g.lineTo(X(i),y):g.moveTo(X(i),y);}); g.stroke();
+  g.fillStyle="#2ea04355";
+  const bw=Math.max(1,(W-pad.l-pad.r)/data.length*0.5);
+  data.forEach((d,i)=>{ g.fillRect(X(i)-bw/2, Yf(d.fps), bw, H-pad.b-Yf(d.fps)); });
+  g.fillStyle="#3fb950"; g.fillText("fps→",W-pad.r+2,10);
+}
+
+/* ============================== /api/status 轮询 ============================== */
+async function pollStatus(){
+  try{
+    const r=await fetch("/api/status",{cache:"no-store"});
+    S.status=await r.json();
+    const up=S.status&&S.status.device?S.status.device.uptime_s:null;
+    if(up!=null&&S.lastUp!=null&&up<S.lastUp){
+      S.syncHist=[]; S.offsetUs=null; S.frames.length=0; S.syncCount=0; vdecReset();
+      syncClock();
+    }
+    if(up!=null) S.lastUp=up;
+    renderStatus();
+  }catch(e){ banner("无法获取设备状态（/api/status）："+e); }
+}
+function renderStatus(){
+  const d=S.status; if(!d) return;
+  const dev=d.device||{}, wf=dev.wifi||{}, usb=d.usb||{};
+  S.usb=usb;
+  const rsig=(dev.source||"")+"|"+((d.supported_res||[]).join(","));
+  if(rsig!==S.resOptSig){ S.resOptSig=rsig; buildResOptions({res:dev.res}); }
+  if(!$("cUsbMode").dataset.editing && dev.usb_mode && $("cUsbMode").value!==dev.usb_mode)
+    $("cUsbMode").value=dev.usb_mode;
+  banner(null);
+  $("bSource").innerHTML="源 <b>USB "+(dev.usb_device||"")+"</b>"+(dev.scaled?"·缩放":"");
+  $("bSource").className="badge "+(usb.state==="streaming"?"ok":"warn");
+  $("bSensor").innerHTML="sensor <b>"+(dev.sensor||"?")+"</b> · "+(dev.pix_fmt||"?");
+  $("bRes").innerHTML=`<b>${dev.res||"?"}</b> · ${dev.fmt||""}`;
+  $("bWifi").innerHTML=`Wi-Fi <b>${wf.mode||"?"} ${wf.phy||""} ch${wf.channel??"?"} ${wf.band_mhz??"?"}MHz</b>`;
+  $("bRssi").innerHTML=`RSSI <b>${wf.rssi!=null?wf.rssi+" dBm":"—"}</b>`;
+  $("bRssi").className="badge "+(wf.rssi>-60?"ok":wf.rssi>-72?"warn":"err");
+  $("ipLink").textContent=dev.ip||"—"; $("ipLink").href="http://"+(dev.ip||"");
+  $("bUp").innerHTML="up <b>"+Math.floor((dev.uptime_s||0)/60)+"m"+Math.floor((dev.uptime_s||0)%60)+"s</b>";
+  $("nCapFps").textContent=fmtN(dev.fps&&dev.fps.capture);
+  $("fCap").textContent=fmtN(dev.fps&&dev.fps.capture,2);
+  $("fEnc").textContent=fmtN(dev.fps&&dev.fps.encode,2);
+  $("fSend").textContent=fmtN(dev.fps&&dev.fps.send,2);
+  $("fTgt").textContent=fmtN(dev.fps_limit,0);
+  $("bAvg").textContent=dev.jpeg_avg_bytes?fmtB(dev.jpeg_avg_bytes):"–";
+  $("bNow").textContent=fmtN(dev.bitrate_mbps,2)+" Mbps";
+  $("rCpu").textContent=fmtN(dev.cpu0,0)+"% / "+fmtN(dev.cpu1,0)+"%";
+  $("rHeap").textContent=fmtB(dev.free_heap||0)+" / "+fmtB(dev.min_heap||0);
+  $("rPs").textContent=fmtB(dev.free_psram||0)+" / "+fmtB(dev.min_psram||0);
+  $("rDrop").textContent=(dev.drop_capture||0)+" / "+(dev.drop_encode||0);
+  $("rKbps").textContent=dev.h264_kbps?fmtN(dev.h264_kbps,0)+" kbps":"–";
+  if(!$("cKbps").dataset.editing && document.activeElement!==$("cKbps") && dev.h264_kbps)
+    $("cKbps").value=dev.h264_kbps;
+  const cl=dev.clients||[];
+  const tb=$("tClients").querySelector("tbody");
+  tb.innerHTML=cl.length?cl.map(c=>`<tr><td>${c.type}</td><td>${c.ip}</td><td>${fmtN(c.fps,1)}</td><td>${fmtN(c.mbps,2)}Mbps</td></tr>`).join("")
+    :"<tr><td colspan=4 style='text-align:center;color:var(--dim)'>—</td></tr>";
+  renderUsb(usb,dev);
+  renderLatSeg(dev);
+}
+function buildResOptions(dev){
+  const sup=(S.status&&S.status.supported_res)||[];
+  const native=new Set();
+  if(S.usb&&S.usb.tiers) S.usb.tiers.forEach(t=>native.add(t.w+"x"+t.h));
+  const prev=$("cRes").value;
+  $("cRes").innerHTML=sup.map(r=>`<option value="${r}">${r}${native.has(r)?"（原生）":"（缩放）"}</option>`).join("");
+  const live=S.status&&S.status.device&&S.status.device.res;
+  let want=(dev&&dev.res)||live||prev;
+  if(want==="0x0") want=(prev&&prev!=="0x0")?prev:(sup[0]||"");
+  if(want&&sup.includes(want)) $("cRes").value=want;
+  else if(want){ $("cRes").innerHTML+=`<option value="${want}">${want}（当前）</option>`; $("cRes").value=want; }
+}
+function renderUsb(usb,dev){
+  const names={disabled:"未启用",no_device:"未插入",ready:"已就绪",streaming:"推流中",error:"打开失败"};
+  const st=names[usb.state]||usb.state||"–";
+  $("uState").textContent=st+" · "+(usb.device||"–")+" · "+(dev.usb_mode||"");
+  $("uDisc").textContent=(usb.disconnects!=null?usb.disconnects:"–")+" 次";
+  if(usb.inherent_ms!=null&&usb.inherent_ms>=0){ $("uInh").textContent=fmtN(usb.inherent_ms,1)+" ms"; }
+  else $("uInh").textContent="未标定";
+  const ci=$("cInh");
+  if(!ci.dataset.editing && document.activeElement!==ci)
+    ci.value=(usb.inherent_ms!=null&&usb.inherent_ms>=0)?usb.inherent_ms:"";
+  const tb=$("tTiers").querySelector("tbody");
+  const tiers=(usb.tiers||[]);
+  tb.innerHTML=tiers.length?tiers.map(t=>`<tr><td>${t.fmt}</td><td>${t.w}x${t.h}</td><td>${(t.fps||[]).join("/")||"-"}</td><td style="color:var(--ok)">原生</td></tr>`).join("")
+    :`<tr><td colspan=4 style='text-align:center;color:var(--dim)'>${usb.state==="disabled"?"编译未启用":"未发现设备"}</td></tr>`;
+}
+function renderLatSeg(dev){
+  const now=(performance.timeOrigin+performance.now())*1000;
+  const w1=S.frames.filter(f=>f.arrive>=now-1e6);
+  const e2e=w1.length?mean(w1.map(f=>f.lat/1000)):null;
+  const esp=w1.length?mean(w1.map(f=>f.enc/1000)):null;
+  const inh=(S.usb&&S.usb.inherent_ms!=null&&S.usb.inherent_ms>=0)?S.usb.inherent_ms:null;
+  $("segCam").textContent=inh!=null?fmtN(inh,1)+" ms（标定）":"未标定";
+  $("segEsp").textContent=esp!=null?fmtN(esp,1)+" ms":"–";
+  const seg3=(e2e!=null&&esp!=null)?(e2e-esp-(inh!=null?inh:0)):null;
+  $("segNet").textContent=seg3!=null?fmtN(seg3,1)+" ms"+(inh==null?"（含①）":""):"–";
+  $("segNet").style.color=(seg3!=null&&seg3<0)?"var(--err)":"";
+  const dec=w1.filter(f=>f.decMs>0);
+  $("segDec").textContent=(dev.usb_mode==="h264"&&dec.length)?fmtN(mean(dec.map(f=>f.decMs)),1)+" ms":"–";
+  const neg=w1.filter(f=>f.lat<0).length;
+  const sy=$("segSync");
+  sy.textContent=w1.length?(neg?("负值帧 "+neg+"/"+w1.length) : "正常（0 负值帧）"):"–";
+  sy.style.color=neg?"var(--err)":"var(--ok)";
+}
+
+/* ============================== 配置 ============================== */
+async function applyConfig(){
+  const body={ source:"usb", usb_mode:$("cUsbMode").value, res:$("cRes").value,
+               fps_limit:+$("cFps").value, transport:S.transport };
+  const mode=$("cUsbMode").value;
+  if(mode==="reencode") body.quality=+$("cQ").value;
+  if(mode==="h264") body.h264_kbps=+$("cKbps").value;
+  body.overlay=$("cOv").checked;
+  body.target_mbps=+$("cBr").value;
+  $("cfgMsg").textContent="应用中…（链路重建约 1~2 s，画面短暂暂停）";
+  try{
+    const r=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json();
+    $("cfgMsg").textContent=j.ok?"已应用 → "+(j.usb_mode||mode)+" "+(j.res||body.res):"失败："+(j.error||r.status);
+    $("cfgMsg").style.color=j.ok?"var(--ok)":"var(--err)";
+    if(j.ok){ await pollStatus(); buildResOptions({res:j.res||body.res}); }
+    /* h264 模式必须 WS；切模式时换传输（H264 走 MJPEG part 无法显示） */
+    if(j.ok){
+      const wantWs = ($("cUsbMode").value==="h264");
+      const wantTr = wantWs?"ws":S.transport;
+      if(S.transport!==wantTr){ S.transport=wantTr; $("cTr").value=wantTr; switchTransport(); }
+      else if(wantWs) switchTransport();   /* H264 流恢复时解码器要重对齐 IDR */
+      vdecReset();
+    }
+  }catch(e){ $("cfgMsg").textContent="请求失败："+e; $("cfgMsg").style.color="var(--err)"; }
+}
+function switchTransport(){
+  if(streamAbort){ try{streamAbort.abort();}catch(e){} }
+  if(S.ws){ const o=S.ws; S.ws=null; o.onclose=null; o.onerror=null; try{o.close();}catch(e){} }
+  vdecReset();
+  $("transportNote").textContent=S.transport==="http"?"HTTP MJPEG":"WebSocket 二进制";
+  $("codecNote").style.display="none";
+  S.frames.length=0;
+  if(S.transport==="http") streamLoop();
+  else if(S.transport==="ws") wsLoop();
+}
+
+/* ============================== 初始化 ============================== */
+async function init(){
+  await syncClock();
+  await pollStatus();
+  const d=S.status&&S.status.device||{};
+  buildResOptions(d);
+  if(d.res)$("cRes").value=d.res;
+  if(d.quality)$("cQ").value=d.quality,$("cQv").textContent=d.quality;
+  if(d.fps_limit)$("cFps").value=d.fps_limit;
+  if(d.usb_mode)$("cUsbMode").value=d.usb_mode;
+  if(d.overlay)$("cOv").checked=true;
+  if(d.target_mbps)$("cBr").value=d.target_mbps;
+  if(d.h264_kbps)$("cKbps").value=d.h264_kbps;
+  if(d.usb_mode==="h264"){ S.transport="ws"; $("cTr").value="ws"; }
+  switchTransport();
+  setInterval(()=>syncClock(),30000);
+  setInterval(()=>{ if(S.offsetUs==null||!(S.syncHist||[]).length) syncClock(); },5000);
+  setInterval(pollStatus,500);
+  setInterval(()=>{bucketSecond();renderLocal();},1000);
+  $("bApply").onclick=applyConfig;
+  /* 输入框 editing 门闩（S31 实录 #8/#9：轮询回写顶掉用户编辑） */
+  ["cInh","cKbps"].forEach(id=>{
+    $(id).onfocus=e=>e.target.dataset.editing=1;
+    $(id).oninput=e=>e.target.dataset.editing=1;
+    $(id).onblur=e=>{
+      const key=id==="cInh"?"inherent_ms":"h264_kbps";
+      const dv=(S.usb&&S.usb[key]!=null)?S.usb[key]:((S.status&&S.status.device||{})[key]);
+      const v=parseFloat(e.target.value);
+      if(dv==null?isNaN(v):v===dv) delete e.target.dataset.editing;
+    };
+  });
+  $("bInh").onclick=async()=>{
+    const v=parseFloat($("cInh").value);
+    if(isNaN(v)) return;
+    try{ await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({usb_inherent_ms:v})}); $("cInh").dataset.editing=""; }catch(e){}
+  };
+  /* 标定向导：c=画面内设备计数(秒)，s=画面内计时器(秒)，①=c−s−offset（自动展开取模） */
+  S.calSamples=[];
+  $("cCalTimer").onchange=e=>{ $("calTimer").style.display=e.target.checked?"":"none"; };
+  (function calTick(){
+    if($("calTimer").style.display!=="none")
+      $("calTimer").textContent=((performance.timeOrigin+performance.now())/1000%100000).toFixed(3);
+    requestAnimationFrame(calTick);
+  })();
+  $("bCalAdd").onclick=()=>{
+    const c=parseFloat($("calC").value)*1000, s=parseFloat($("calS").value)*1000;
+    const out=$("calOut");
+    if(S.offsetUs==null){ out.textContent="尚未完成时钟同步（看顶部 clock 徽章），稍候再记录"; out.style.color="var(--err)"; return; }
+    if(isNaN(c)||isNaN(s)){ out.textContent="请把照片里读到的两个数都填上（秒，3 位小数）"; out.style.color="var(--err)"; return; }
+    const now=(performance.timeOrigin+performance.now())*1000;
+    const w1=S.frames.filter(f=>f.arrive>=now-1e6);
+    const e2e=w1.length?mean(w1.map(f=>f.lat/1000)):null;
+    const esp=w1.length?mean(w1.map(f=>f.enc/1000)):null;
+    if(e2e!=null&&esp!=null&&e2e<esp+1){
+      out.innerHTML=`<span style="color:var(--err)">本页时钟同步异常（e2e=${fmtN(e2e,1)}ms &lt; 编码 ${fmtN(esp,1)}ms，物理不可能）——刷新等窗口重建或换机器再采样</span>`;
+      return;
+    }
+    const fullNowS=(performance.timeOrigin+performance.now())/1000;
+    const sSec=s/1000;
+    const sFullMs=(sSec+Math.round((fullNowS-sSec)/100000)*100000)*1000;
+    const d=c-sFullMs-S.offsetUs/1000;
+    S.calSamples.push(d);
+    const m=mean(S.calSamples), sd=std(S.calSamples);
+    $("calC").value=$("calS").value="";
+    out.style.color="";
+    out.innerHTML=`样本 ${S.calSamples.length}：本次 ①=${fmtN(d,1)} ms · 均值 <b>${fmtN(m,1)} ms</b> · σ ${fmtN(sd==null?0:sd,1)} ms`+
+      (d<0||d>1000?" · <span style='color:var(--err)'>本样本异常（合理 5~500ms）：两数填反/抄错位？建议弃用</span>":"");
+    $("bCalWrite").style.display=S.calSamples.length?"":"none";
+    $("calN").textContent=S.calSamples.length;
+  };
+  $("bCalWrite").onclick=async()=>{
+    const m=mean(S.calSamples);
+    if(m==null||m<0||m>1000){ $("calOut").innerHTML="<span style='color:var(--err)'>均值超出合理范围（5~500ms），请弃用离群样本后重试</span>"; return; }
+    try{
+      await fetch("/api/config",{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify({usb_inherent_ms:Math.round(m*10)/10})});
+      delete $("cInh").dataset.editing;
+      $("cfgMsg").textContent="已写入标定值 ①="+fmtN(m,1)+" ms";
+      $("cfgMsg").style.color="var(--ok)";
+      pollStatus();
+    }catch(e){}
+  };
+  $("cUsbMode").onfocus=e=>e.target.dataset.editing=1;
+  $("cUsbMode").onblur=e=>delete e.target.dataset.editing;
+  $("cUsbMode").onchange=()=>applyConfig();
+  $("cRes").onfocus=e=>e.target.dataset.editing=1;
+  $("cRes").onblur=e=>delete e.target.dataset.editing;
+  $("cRes").onchange=()=>applyConfig();
+  $("cQ").oninput=e=>$("cQv").textContent=e.target.value;
+  $("cQ").onchange=()=>applyConfig();
+  $("cFps").onchange=()=>applyConfig();
+  $("cKbps").onchange=()=>applyConfig();
+  $("cTr").onchange=e=>{S.transport=e.target.value;switchTransport();};
+}
+/* 叠加文字跟随画面更新（复用 renderLocal 节拍） */
+const _rl=renderLocal;
+renderLocal=function(){ _rl();
+  const f=S.frames[S.frames.length-1];
+    if(f) overlayText({w:f.w||0,h:f.h||0,fid:f.fid,len:f.len,codec:f.codec,key:f.key,q:f.q||0},f.lat,f.enc);
+};
+init();
+</script>
+</body>
+</html>
