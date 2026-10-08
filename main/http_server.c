@@ -306,9 +306,10 @@ static esp_err_t h_config(httpd_req_t *req)
             ok = false;
         }
     }
-    /* 3) 摄像头内部固有延迟标定值（U4：只能由光学闭环人工标定，设备绝不自行生成） */
-    if (ok && inh && cJSON_IsNumber(inh) && inh->valuedouble >= 0) {
-        src_if_usb_set_inherent_ms((float)inh->valuedouble);
+    /* 3) 摄像头内部固有延迟标定值（U4：只能由光学闭环人工标定，设备绝不自行生成）；
+     *    负值 = 清除标定（回到未标定态） */
+    if (ok && inh && cJSON_IsNumber(inh)) {
+        src_if_usb_set_inherent_ms(inh->valuedouble >= 0 ? (float)inh->valuedouble : -1.0f);
     }
 
     if (ov && cJSON_IsBool(ov)) {

@@ -203,8 +203,8 @@ footer{margin-top:16px;color:var(--dim);font-size:12px;border-top:1px solid var(
         <span class="k">内部固有延迟（标定值）</span><span class="v" id="uInh">未标定</span>
       </div>
       <div class="row2" style="margin-top:6px">
-        <label class="ctl"><span class="lab">标定值 ms（光学闭环实测后填入）</span>
-          <span><input type="number" id="cInh" step="0.1" min="0" style="width:70px"> <button id="bInh" style="padding:3px 8px">写入</button></span></label>
+        <label class="ctl"><span class="lab">标定值 ms（光学闭环实测后填入；负数=清除标定）</span>
+          <span><input type="number" id="cInh" step="0.1" style="width:70px"> <button id="bInh" style="padding:3px 8px">写入</button></span></label>
         <div class="note">⚠️ Korvo-1 Type-A 经 TPS2051C 限流 500 mA；推流掉线/反复打开失败请用 Type-C (Power) 口补供电。</div>
       </div>
       <!-- 光学标定向导：照片同时冻结"曝光瞬间的计时器"与"到达瞬间的设备计数"，
@@ -844,7 +844,8 @@ async function init(){
   $("cInh").onfocus=e=>e.target.dataset.editing=1;
   $("bInh").onclick=async()=>{
     const v=parseFloat($("cInh").value);
-    if(isNaN(v)||v<0) return;
+    if(isNaN(v)) return;
+    /* 负数=清除标定（回到未标定态）；≥0 为正常写入 */
     try{ await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({usb_inherent_ms:v})}); $("cInh").dataset.editing=""; }catch(e){}
   };
   /* ---------- 光学标定向导（U4：① 只能光学实测） ----------
@@ -874,19 +875,24 @@ async function init(){
       out.innerHTML=`<span style="color:var(--err)">本页时钟同步异常（e2e=${fmtN(e2e,1)}ms &lt; 编码 ${fmtN(esp,1)}ms，物理不可能）——刷新页面等窗口重建，或换一台 e2e&gt;编码 的机器再采样</span>`;
       return;
     }
-    const d=c-s-S.offsetUs/1000;
+    /* 计时器显示按 100000s 取模（缩短位数）：把输入读数展开到离当前全值最近的周期，
+     * 否则 ① 会混入 m×10⁸ ms 的取模常数（真机实测恰好多了 1791400000000 ms） */
+    const fullNowS=(performance.timeOrigin+performance.now())/1000;
+    const sSec=s/1000;
+    const sFullMs=(sSec+Math.round((fullNowS-sSec)/100000)*100000)*1000;
+    const d=c-sFullMs-S.offsetUs/1000;
     S.calSamples.push(d);
     const m=mean(S.calSamples), sd=std(S.calSamples);
     $("calC").value=$("calS").value="";
     out.style.color="";
     out.innerHTML=`样本 ${S.calSamples.length}：本次 ①=${fmtN(d,1)} ms · 均值 <b>${fmtN(m,1)} ms</b> · σ ${fmtN(sd==null?0:sd,1)} ms`+
-      (d<0?" · <span style='color:var(--err)'>本次为负：读数抄错或快门抓到刷新中的屏，可弃用重拍</span>":"");
+      (d<0||d>1000?" · <span style='color:var(--err)'>本样本异常（合理范围 5~500ms）：多为两个数填反/抄错位，建议弃用重拍</span>":"");
     $("bCalWrite").style.display=S.calSamples.length?"":"none";
     $("calN").textContent=S.calSamples.length;
   };
   $("bCalWrite").onclick=async()=>{
     const m=mean(S.calSamples);
-    if(m==null||m<0) return;
+    if(m==null||m<0||m>1000){ $("calOut").innerHTML="<span style='color:var(--err)'>均值超出合理范围（5~500ms），请弃用离群样本后重试</span>"; return; }
     try{
       await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({usb_inherent_ms:Math.round(m*10)/10})});
       $("cfgMsg").textContent="已写入标定值 ①="+fmtN(m,1)+" ms（三段拆分闭合：③=端到端−①−②）";
