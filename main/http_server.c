@@ -66,12 +66,13 @@ static const char OVERLAY_HTML[] =
 "button{background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:8px 16px;font-size:14px}</style></head><body>"
 "<h1>光学闭环校验（金标准）</h1>"
 "<ol>"
-"<li>点下面按钮开启<b>画面叠加</b>：图像左上角会烧录设备本地毫秒计数（esp_timer，单调钟）。</li>"
+"<li>点下面按钮开启<b>画面叠加</b>：图像正中会烧录设备本地毫秒计数（esp_timer，单调钟）。</li>"
 "<li>让摄像头对准另一块屏幕/手机，屏上显示精确到毫秒的计时器（任意 ms 计时网页全屏即可）。</li>"
 "<li>连拍 ≥10 张流画面：画面内<b>设备计数</b>与照片里<b>屏幕计时</b>之差 = 端到端系统偏差"
 "（含设备打点→编码→Wi-Fi→浏览器渲染→屏幕刷新→快门全路径）。取均值与波动记录到 RESULTS_TEMPLATE.md。</li>"
 "</ol>"
-"<p><b>USB 摄像头注意</b>：叠加只能在 <code>reencode</code> 模式绘制（直通模式不解码）。"
+"<p><b>USB 摄像头注意</b>：叠加只能在 <code>reencode</code> 模式绘制（直通模式不解码）；"
+"开启叠加时若 USB 处于直通模式，设备会自动切换到重编码。"
 "USB 通路下该偏差就是「真实端到端」，与网页时钟同步法相减即得<b>摄像头内部固有延迟</b>（唯一测法）。</p>"
 "<button onclick=\"fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({overlay:true})}).then(()=>document.body.append(' 已开启，请回主页看画面'))\">开启画面毫秒叠加</button>"
 "<p>网页「时钟同步法」测得的时延 + 本页标定偏差 ≈ 真实光学端到端时延。误差来源分析见 README。</p>"
@@ -304,7 +305,18 @@ static esp_err_t h_config(httpd_req_t *req)
         src_if_usb_set_inherent_ms((float)inh->valuedouble);
     }
 
-    if (ov && cJSON_IsBool(ov)) src_if_set_overlay(cJSON_IsTrue(ov));
+    if (ov && cJSON_IsBool(ov)) {
+        bool ov_on = cJSON_IsTrue(ov);
+        src_if_set_overlay(ov_on);
+        /* passthrough 不解码、无法烧录毫秒计数器：开启叠加时自动切重编码（set_mode 同步重开并带回滚），
+         * /overlay 校验页只发 {overlay:true}，靠这一步保证 USB 直通下计数器也能真正出现 */
+        if (ov_on && src_if_current() == VIDEO_SOURCE_USB &&
+            src_if_usb_mode() == USB_MODE_PASSTHROUGH) {
+            esp_err_t merr = src_if_usb_set_mode(USB_MODE_REENCODE);
+            if (merr != ESP_OK)
+                ESP_LOGW(TAG, "overlay 需要重编码，但 USB 模式切换失败：%s", esp_err_to_name(merr));
+        }
+    }
     if (br && cJSON_IsNumber(br)) metrics_set_target_mbps(br->valuedouble);
 
     bool need_rebuild = false;

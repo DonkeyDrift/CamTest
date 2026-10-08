@@ -12,7 +12,7 @@ typedef enum {
 } osd_fmt_t;
 
 /*
- * 在帧左上角绘制 esp_timer 毫秒计数（%08lu，含分隔点），5x7 点阵字体放大 scale 倍。
+ * 在帧正中绘制 esp_timer 毫秒计数（秒.毫秒），5x7 点阵字体放大 scale 倍。
  * stride 为一行字节数（可能大于宽*bpp）。只改 luma（Y/R/G 通道），色度不动，
  * 供摄像头对准"另一块屏上显示的毫秒计时"做光学校验（见 README）。
  */

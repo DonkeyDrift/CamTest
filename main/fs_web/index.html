@@ -418,16 +418,21 @@ async function streamLoop(){
      30 : jpeg_len      u32
      34 : reserved      u16  → 共 36B
    ====================================================================== */
+/* WS 连接代号：每次 wsLoop 递增。旧 socket 被替换/关闭时其 onclose 一律作废——
+ * 否则 switchTransport 关掉旧连接后，旧 onclose 仍会再排一个 wsLoop 定时器，
+ * 该定时器又关掉新连接→再排定时器……形成永久「WS 断开 1s 重连」风暴（实测复现） */
+let wsGen=0;
 function wsLoop(){
-  if(S.ws){ try{S.ws.close();}catch(e){} }
+  wsGen++; const g=wsGen;
+  if(S.ws){ const o=S.ws; S.ws=null; o.onclose=null; o.onerror=null; try{o.close();}catch(e){} }
   if(S.transport!=="ws") return;
   const host=location.hostname||"korvo-s31.local";
   const ws=new WebSocket("ws://"+host+":81/ws");
   S.ws=ws;
   ws.binaryType="arraybuffer";
-  ws.onopen=()=>{ $("streamHint").style.display="none"; banner(null); };
+  ws.onopen=()=>{ if(g!==wsGen) return; $("streamHint").style.display="none"; banner(null); };
   ws.onmessage=ev=>{
-    if(!(ev.data instanceof ArrayBuffer)) return;
+    if(g!==wsGen||!(ev.data instanceof ArrayBuffer)) return;
     const dv=new DataView(ev.data);
     if(dv.getUint32(0,true)!==0x31504A4D){ return; } // "MJP1" 小端
     const fid=dv.getUint32(4,true);
@@ -438,7 +443,11 @@ function wsLoop(){
     const source=dv.getUint8(29);   /* 0=dvp 1=usb（固件 hdr[29]） */
     onFrame({fid,cap,enc,len,q,sensor:S.sensorName||"",res:w+"x"+h,source:source===1?"usb":"dvp",scaled:0,tsm:source===1?"frame_arrival":"sensor_out"}, new Uint8Array(ev.data,36,len), performance.timeOrigin+performance.now());
   };
-  ws.onclose=()=>{ if(S.transport==="ws"){ $("streamHint").textContent="WS 断开，1 s 后重连…";$("streamHint").style.display="flex"; setTimeout(wsLoop,1000);} };
+  ws.onclose=()=>{
+    if(g!==wsGen||S.transport!=="ws") return;
+    $("streamHint").textContent="WS 断开，1 s 后重连…";$("streamHint").style.display="flex";
+    setTimeout(()=>{ if(g===wsGen&&S.transport==="ws") wsLoop(); },1000);
+  };
   ws.onerror=()=>{ try{ws.close();}catch(e){} };
 }
 
@@ -684,16 +693,20 @@ async function applyConfig(){
   try{
     const r=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     const j=await r.json();
-    $("cfgMsg").textContent=j.ok?"已应用 → "+(j.res||body.res)+(j.restarted?"（链路已重建）":""):"失败："+(j.error||r.status);
+    $("cfgMsg").textContent=j.ok?"已应用 → "+(j.res||body.res)+(j.restarted?"（链路已重建）":"")+(j.usb_mode&&body.usb_mode==="passthrough"&&j.usb_mode==="reencode"?"（叠加计数器需解码：USB 已自动切为重编码）":""):"失败："+(j.error||r.status);
     $("cfgMsg").style.color=j.ok?"var(--ok)":"var(--err)";
-    if(j.ok&&j.transport!==S.transport){ S.transport=j.transport||body.transport; switchTransport(); }
+    if(j.usb_mode) $("cUsbMode").value=j.usb_mode;   /* 设备端可能自动切了重编码（开叠加时），回填下拉 */
+    /* 传输是纯浏览器侧行为，设备不管理；仅当设备明确回传不同值时才切换。
+     * ★ 不能用 j.transport!==S.transport 直接比：设备从不回传 transport，
+     *   undefined!=="ws" 恒真 → 每次应用配置都会重启流并留下重连定时器（WS 风暴根源之一） */
+    if(j.ok&&j.transport&&j.transport!==S.transport){ S.transport=j.transport; $("cTr").value=j.transport; switchTransport(); }
     /* 先刷新状态（拿到新源的 supported_res）再重建下拉，并锚定真正生效的分辨率 */
     if(j.ok){ await pollStatus(); buildResOptions({source:j.source||body.source,res:j.res||body.res}); }
   }catch(e){ $("cfgMsg").textContent="请求失败："+e; $("cfgMsg").style.color="var(--err)"; }
 }
 function switchTransport(){
   if(streamAbort){ try{streamAbort.abort();}catch(e){} }
-  if(S.ws){ try{S.ws.close();}catch(e){} S.ws=null; }
+  if(S.ws){ const o=S.ws; S.ws=null; o.onclose=null; o.onerror=null; try{o.close();}catch(e){} }  /* 摘掉 onclose 再关：防旧连接的定时重连杀掉新连接 */
   $("transportNote").textContent=S.transport==="http"?"HTTP MJPEG":S.transport==="ws"?"WebSocket 二进制":"UDP 分片(需外部脚本)";
   S.frames.length=0;
   if(S.transport==="http") streamLoop();

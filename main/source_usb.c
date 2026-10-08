@@ -462,7 +462,10 @@ static esp_err_t encoder_open(int w, int h, uint8_t quality)
         s_u.enc_in[i].start = heap_caps_aligned_alloc(4096, (size_t)w * h * 2 + 4096,
                                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!s_u.enc_in[i].start) {
-            ESP_LOGE(TAG, "enc IN[%d] PSRAM 分配失败", i);
+            /* 常见于多客户端运行后碎片化：空闲总量够但最大连续块不够，与供电无关 */
+            ESP_LOGE(TAG, "enc IN[%d] PSRAM 分配失败：重编码 %dx%d 需 %zu KB 连续块×%d，"
+                          "请改用 ≤640x480 重编码或 passthrough",
+                     i, w, h, ((size_t)w * h * 2 + 4096) / 1024, ENC_IN_BUFS);
             goto fail;
         }
         s_u.enc_in[i].length = (size_t)w * h * 2 + 4096;

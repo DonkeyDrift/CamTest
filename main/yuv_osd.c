@@ -43,7 +43,12 @@ void yuv_osd_draw_ms_counter(uint8_t *buf, size_t stride, int w, int h,
     snprintf(text, sizeof(text), "%llu.%03llu", (unsigned long long)(ms / 1000),
              (unsigned long long)(ms % 1000));
     int scale = (w >= 640) ? 4 : (w >= 320) ? 3 : 2;
-    int cx = 4, cy = 4;
+    int n = 0;
+    for (const char *p = text; *p; p++) n++;
+    int tw = (6 * n - 1) * scale, th = 7 * scale;   /* 每字 5 列+1 间隔，末字无间隔 */
+    int cx = (w - tw) / 2, cy = (h - th) / 2;       /* 屏幕正中（画面过小放不下时贴左上） */
+    if (cx < 0) cx = 0;
+    if (cy < 0) cy = 0;
     for (const char *p = text; *p; p++) {
         int gi = (*p == '.') ? 10 : (*p - '0');
         if (gi < 0 || gi > 10) { cx += scale; continue; }

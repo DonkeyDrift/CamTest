@@ -151,7 +151,7 @@ done:
 /* ---------------- WebSocket 客户端 ---------------- */
 static void ws_send_frame(client_t *c, const frame_slot_t *s)
 {
-    uint8_t hdr[36];
+    uint8_t hdr[36] = {0};   /* 应用层头为小端（与网页 DataView little-endian 一致）；WS 长度字段另按 RFC 大端 */
     memcpy(hdr, "MJP1", 4);   /* 与网页约定：头 4 字节 magic，浏览器按小端 u32 校验 0x31504A4D */
     memcpy(hdr + 4, &s->fid, 4);
     memcpy(hdr + 8, &s->t_capture_us, 8);
@@ -168,20 +168,23 @@ static void ws_send_frame(client_t *c, const frame_slot_t *s)
     if (!msg) return;
     memcpy(msg, hdr, 36);
     memcpy(msg + 36, s->data, s->len);
-    /* WS 二进制帧：FIN=1 opcode=2；长度 7/16/64-bit */
+    /* WS 二进制帧：FIN=1 opcode=2；长度 7/16/64-bit。
+     * ★ RFC6455 多字节长度是【网络字节序(大端)】——小端写法浏览器会把
+     * 0x348E 解析成 0x8E34（13454→36404），消息边界失步后收到垃圾长度
+     * 触发 1009/协议错关闭 → 页面永远"WS 断开，1 s 后重连" */
     uint8_t wh[10];
     int whn = 0;
     wh[whn++] = 0x82;
-    if (s->len + 36 < 126) {
-        wh[whn++] = s->len + 36;
-    } else if (s->len + 36 < 65536) {
+    size_t total = s->len + 36;
+    if (total < 126) {
+        wh[whn++] = total;
+    } else if (total < 65536) {
         wh[whn++] = 126;
-        uint16_t l = s->len + 36;
-        memcpy(wh + whn, &l, 2); whn += 2;
+        wh[whn++] = (uint8_t)(total >> 8);
+        wh[whn++] = (uint8_t)(total & 0xFF);
     } else {
         wh[whn++] = 127;
-        uint64_t l = s->len + 36;
-        memcpy(wh + whn, &l, 8); whn += 8;
+        for (int i = 7; i >= 0; i--) wh[whn++] = (uint8_t)((uint64_t)total >> (i * 8));
     }
     int rc = send_all(c->fd, wh, whn) || send_all(c->fd, msg, 36 + s->len);
     free(msg);

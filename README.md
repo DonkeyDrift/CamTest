@@ -263,6 +263,12 @@ OV3660 仅 240×240@24 与 640×480@10（YUYV/RGB565）——矩阵中其余档�
 | 8 | 真实 UI 环境（多浏览器 tab 持流 + 500ms 状态轮询）下切换分辨率仍可能触发 #6 的流泄漏 | `stream_start`/`encoder_open` 失败路径原为裸 `uvc_host_stream_close`（无 drain）——start 已 unpause 后失败必踩"帧未归还→close 失败→泄漏"；teardown_req 事件丢失时流悬挂无自愈 | 抽 `safe_close_stream()`（多轮 drain+close）统一所有关闭路径；monitor 检测 `want=0 且流悬挂` 自动补 teardown；帧环 3→5 槽（多客户端各持槽引用时 3 槽会 publish 全失败，实测 out_drops 4661）。加固后 18 次快速连切（2 个限速客户端 + 轮询，含 720p）**零失败零丢帧** |
 | 9 | **UI 切分辨率"看似无效"**：下拉选完应用后立即弹回 1280x720；之后再点"应用配置"或动质量/帧率任意控件，设备被悄悄切到 720p | applyConfig 成功后 `buildResOptions()` 用 `innerHTML` 重建 `<select>` 选项，浏览器把选中项重置回**第一项**（supported_res 首项恰为 1280x720）；且源切换瞬间 S.status.supported_res 还是旧源档位表 | buildResOptions 重建后恢复选中项（当前档不在表内时追加"（当前）"选项兜底）；applyConfig 先 pollStatus 刷新档位表再锚定设备实际生效的 j.res；renderStatus 检测档位表变化自动重建。浏览器实测：USB/DVP 往返 + 176/352/640 连切，下拉保持、横幅一致、原始流真实帧尺寸全部吻合 |
 | 10 | **切分辨率/模式后 USB 永久打不开**（res=0x0、usb.state=error，重插不恢复） | 四因叠加：① 开流窗口（encoder_open + rebuild_tiers 串口灌 38 行约 200~600ms）排队帧被 `xQueueReset` **静默丢弃** → 帧计数泄漏 → close 永久 "Not all frames are returned" → 流对象占住接口，此后一切 open 恒 `INVALID_ARG`；② teardown close 失败后置 `stream=NULL` 弃句柄，尾帧再也无法归还；③ monitor 自愈在**锁外**读 want/stream，残余 teardown_req 在新流 start 后 12~16ms 误杀之（串口实证 "want=1" teardown）；④ `set_mode` 先翻 mode 再 teardown，worker 把旧格式帧误路由 | ① 开流收尾改 `drain_work_queue` 归还排队帧（日志实证 "开流收尾归还 N 个排队帧"）；② `ret_frame()` 统一归还+记账（`frames_held`，close 前必须归零）；③ close 失败保留句柄交 monitor 重试；④ monitor teardown 改**锁内二次求值**；⑤ set_mode 先 teardown 后翻 mode。验证：14 步复现矩阵全绿 + 20 次模式往返（reencode↔passthrough × 4 档）零失败，串口 0 "Not all frames"、0 误杀 |
+| 11 | **WS 二进制传输永久"WS 断开，1 s 后重连"风暴**（修完协议仍复现；串口实证单客户端 20-70ms 连接即断、~2s 周期循环 710 次） | 三因叠加：① `ws_send_frame` 的 WS 扩展长度字段按**小端 memcpy**——RFC6455 规定多字节长度是**网络序（大端）**，13454B 帧被浏览器解析成 36404B，消息边界失步→协议错关闭（此为首发根因）；② 设备 `/api/config` 响应**从不回传 transport 字段**，前端 `j.transport!==S.transport`（undefined!=="ws"）恒真 → **每次应用配置都重启流**；③ `switchTransport`/`wsLoop` 关闭旧 socket 前**不摘除 onclose**，旧连接的 onclose 再排一个 1s 定时器，定时器又关掉新连接→再排……每次应用配置**净增一条自持重连链**，反复调参后多链互杀形成风暴 | ① 长度字段改显式大端逐字节写（自写 RFC6455 探针 5 帧全绿）；② applyConfig 仅当设备**明确回传**不同 transport 才切换（`j.transport&&`前置）；③ 引入 `wsGen` 连接代号：wsLoop 递增并作废旧代号定时器，关闭旧 socket 前摘除 onclose/onerror，onclose 回调校验代号才允许排重连。验证：浏览器两次连点应用配置 WS 零断流（帧计数 225→272 连续）、串口单次 connected 零 gone、烧录重启后 1s 自动重连恢复（gen=2） |
+
+> 另（USB 侧补充）：**1280×720 reencode 在多客户端运行后可能开不起来**——需 2 个 1.8MB
+> PSRAM 连续块，碎片化后最大连续块不足（空闲总量 7MB 仍会失败，日志已注明与供电无关）。
+> 重编码光学校验请用 ≤640×480；`yuv_osd` 毫秒计数器已改为**画面正中**烧录（DVP/USB 通用），
+> 且开叠加时 USB 若处于直通模式，设备会**自动切重编码**（`h_config`，同步重开带回滚）。
 
 另：显式指定帧率（如 60.0f）在 `uvc_claim_interface` 的描述符匹配中失败过一次（驱动按 `10e6/interval` 的浮点值匹配），故统一传 fps=0 用设备默认帧间隔。
 
@@ -419,8 +425,8 @@ DVP 与 USB UVC 可运行时热切换（`POST /api/config {"source":"usb"|"dvp"}
 
 - 本板 **Type-A USB 为 Host-only**：作为 **Host 接 UVC 摄像头**（本工程 USB 通路）没有问题；
   只是做不了 UVC Device（把画面喂给 PC）。
-- USB **passthrough 模式无法叠加 OSD**（不解码）——光学校验请在 reencode 模式做，
-  两种模式的摄像头内部延迟差即摄像头内部 JPEG 编码耗时（可各自标定后差分）。
+- USB **passthrough 模式无法叠加 OSD**（不解码）——主页/`/overlay` 开启叠加时设备会**自动切到
+  reencode**（同步重开、失败回滚）；两种模式的摄像头内部延迟差即摄像头内部 JPEG 编码耗时（可各自标定后差分）。
 - USB 摄像头多数**不支持 160×120**（通常最低 320×240 或 176×144）：DonkeyCar 若以 160×120
   为推理输入，DVP 的软件抽取档可直接给，USB 直通档位以描述符枚举为准（reencode 可经缩放给到 160×120）。
 - USB passthrough 的画质/帧率/曝光策略由摄像头固件决定，本系统**无法干预也无法如实上报
