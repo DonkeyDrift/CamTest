@@ -185,6 +185,8 @@ esp_err_t src_if_switch(video_source_t want)
         ESP_LOGE(TAG, "启动 %s 失败（%s），回滚到 %s",
                  src_if_source_name(want), esp_err_to_name(err), src_if_source_name(prev));
         if (want != prev) {
+            wb->stop();                          /* ★ 撤销目标源的 want_stream，否则 monitor
+                                                    * 会在后台继续重试开流，成功后与回滚源双发同一帧环 */
             be(prev)->start();                   /* 尽力回滚，不死机 */
         }
         xSemaphoreGive(s_if.lock);

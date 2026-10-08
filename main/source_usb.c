@@ -55,10 +55,11 @@
 static const char *TAG = "src_usb";
 
 #define USB_DEV_ANY          0
-#define FRAME_BUFFERS        4      /* uvc 驱动帧缓冲数（按协商出的 dwMaxVideoFrameSize 自分配 PSRAM） */
-#define NUM_URBS             4
+#define FRAME_BUFFERS        4      /* uvc 驱动帧缓冲数（按协商 dwMaxVideoFrameSize 自分配 PSRAM；4 个平滑 60fps 突发） */
+#define NUM_URBS             8      /* ISOC 在途 URB 数：4×10KB 仅 1.5ms 微帧覆盖，抖动即丢包（FID 错→整帧弃）；
+                                         * 8×10KB=3ms（URB 为内部 DMA RAM，8 个约 80KB 可承受） */
 #define URB_SIZE             (10 * 1024)
-#define WORK_QUEUE_LEN       4
+#define WORK_QUEUE_LEN       4      /* 与 FRAME_BUFFERS 对齐（深于驱动缓冲数无意义） */
 #define STREAM_OPEN_TIMEOUT_MS 5000
 #define RETRY_BACKOFF_MS     1000   /* ERROR 态重试间隔（供电不足场景别疯狂重试） */
 #define ENC_IN_BUFS          2
@@ -71,7 +72,10 @@ struct usb_priv_s {
     usb_host_client_handle_t client;
     volatile bool dev_present;
     uint8_t  dev_addr;
-    uint8_t  stream_index;
+    uint8_t  stream_index;                  /* 当前尝试的 UVC function */
+    uint8_t  idx_candidates[8];             /* 部分摄像头暴露多个 UVC function
+                                               （如 0bda:1376 双通道，仅其一响应 VS Probe） */
+    int      idx_cand_n;
     uint16_t vid, pid;
     char     dev_name[SRC_USB_NAME_MAX];        /* "vid:pid" */
 
@@ -259,19 +263,16 @@ static void probe_device(uint8_t dev_addr)
     }
     if (!name[0]) strlcpy(name, "unknown", sizeof(name));
 
-    /* 探测 UVC 功能与流索引，列出档位 */
-    size_t need = 0;
-    uint8_t found_idx = 0;
-    bool is_uvc = false;
-    for (uint8_t idx = 0; idx < 6; idx++) {
-        need = 0;
+    /* 探测 UVC 功能：收集全部含档位表的流索引作候选（部分摄像头第一个 function
+     * 是不响应 VS Probe 控制请求的哑通道，打开时逐个尝试） */
+    int cand_n = 0;
+    for (uint8_t idx = 0; idx < 6 && cand_n < (int)sizeof(s_u.idx_candidates); idx++) {
+        size_t need = 0;
         if (uvc_host_get_frame_list(dev_addr, idx, NULL, &need) == ESP_OK && need > 0) {
-            is_uvc = true;
-            found_idx = idx;
-            break;
+            s_u.idx_candidates[cand_n++] = idx;
         }
     }
-    if (!is_uvc) {
+    if (cand_n == 0) {
         ESP_LOGI(TAG, "USB 设备 %s (addr %u) 不是 UVC 摄像头，忽略", name, dev_addr);
         return;
     }
@@ -279,17 +280,19 @@ static void probe_device(uint8_t dev_addr)
     xSemaphoreTake(s_u.lock, portMAX_DELAY);
     s_u.dev_present = true;
     s_u.dev_addr = dev_addr;
-    s_u.stream_index = found_idx;
+    s_u.idx_cand_n = cand_n;
+    s_u.stream_index = s_u.idx_candidates[0];
     strlcpy(s_u.dev_name, name, sizeof(s_u.dev_name));
     size_t cap = sizeof(s_u.frame_info) / sizeof(s_u.frame_info[0]);
     s_u.frame_info_n = 0;
-    if (uvc_host_get_frame_list(dev_addr, found_idx, (uvc_host_frame_info_t (*)[])s_u.frame_info, &cap) == ESP_OK) {
+    if (uvc_host_get_frame_list(dev_addr, s_u.stream_index, (uvc_host_frame_info_t (*)[])s_u.frame_info, &cap) == ESP_OK) {
         s_u.frame_info_n = cap;
     }
     xSemaphoreGive(s_u.lock);
 
-    ESP_LOGI(TAG, "===== UVC 设备已连接：name=%s VID/PID=%04x/%04x addr=%u stream_idx=%u =====",
-             name, s_u.vid, s_u.pid, dev_addr, found_idx);
+    ESP_LOGI(TAG, "===== UVC 设备已连接：name=%s VID/PID=%04x/%04x addr=%u 流索引候选=[%d 个: %u%s] =====",
+             name, s_u.vid, s_u.pid, dev_addr, cand_n, s_u.idx_candidates[0],
+             cand_n > 1 ? ",…" : "");
     rebuild_tiers();
     /* monitor 任务按 want_stream 自动开始推流 */
 }
@@ -381,10 +384,18 @@ static void encoder_close(void)
         close(s_u.enc_fd);
         s_u.enc_fd = -1;
     }
+    for (int i = 0; i < ENC_IN_BUFS; i++) {
+        if (s_u.enc_in[i].start) {
+            heap_caps_free(s_u.enc_in[i].start);   /* USERPTR：自有缓冲自行释放 */
+            s_u.enc_in[i].start = NULL;
+            s_u.enc_in[i].length = 0;
+        }
+    }
 }
 
 static esp_err_t encoder_open(int w, int h, uint8_t quality)
 {
+    ESP_LOGI(TAG, "encoder_open: %dx%d q%u（/dev/video10）", w, h, quality);
     s_u.enc_fd = open(ESP_VIDEO_JPEG_DEVICE_NAME, O_RDWR);   /* /dev/video10 */
     ESP_RETURN_ON_FALSE(s_u.enc_fd >= 0, ESP_FAIL, TAG, "open %s", ESP_VIDEO_JPEG_DEVICE_NAME);
     struct timeval tv = { .tv_sec = 0, .tv_usec = ENC_DQBUF_TIMEOUT_MS * 1000 };
@@ -393,48 +404,78 @@ static esp_err_t encoder_open(int w, int h, uint8_t quality)
     struct v4l2_format fo = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT,
                               .fmt.pix.width = w, .fmt.pix.height = h,
                               .fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY };
-    ESP_RETURN_ON_ERROR(xioctl(s_u.enc_fd, VIDIOC_S_FMT, &fo) ? ESP_FAIL : ESP_OK, TAG, "enc S_FMT OUT");
+    if (xioctl(s_u.enc_fd, VIDIOC_S_FMT, &fo) != 0) {
+        ESP_LOGE(TAG, "enc S_FMT OUTPUT 失败 errno=%d", errno);
+        goto fail;
+    }
     struct v4l2_format fc = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
                               .fmt.pix.width = w, .fmt.pix.height = h,
                               .fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG };
-    ESP_RETURN_ON_ERROR(xioctl(s_u.enc_fd, VIDIOC_S_FMT, &fc) ? ESP_FAIL : ESP_OK, TAG, "enc S_FMT CAP");
+    if (xioctl(s_u.enc_fd, VIDIOC_S_FMT, &fc) != 0) {
+        ESP_LOGE(TAG, "enc S_FMT CAPTURE 失败 errno=%d", errno);
+        goto fail;
+    }
     /* 不发 CHROMA_SUBSAMPLING 控件（esp_video 2.2.0 HAL 断言坑，见 API_NOTES.md） */
     struct v4l2_ext_control ctrl = { .id = V4L2_CID_JPEG_COMPRESSION_QUALITY, .value = quality };
     struct v4l2_ext_controls ctrls = { .count = 1, .controls = &ctrl };
-    ESP_RETURN_ON_ERROR(xioctl(s_u.enc_fd, VIDIOC_S_EXT_CTRLS, &ctrls) ? ESP_FAIL : ESP_OK, TAG, "enc quality");
+    if (xioctl(s_u.enc_fd, VIDIOC_S_EXT_CTRLS, &ctrls) != 0) {
+        ESP_LOGE(TAG, "enc quality 失败 errno=%d", errno);
+        goto fail;
+    }
 
-    struct v4l2_requestbuffers rq = { .count = ENC_IN_BUFS, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_MMAP };
-    ESP_RETURN_ON_ERROR(xioctl(s_u.enc_fd, VIDIOC_REQBUFS, &rq) ? ESP_FAIL : ESP_OK, TAG, "enc REQBUFS OUT");
+    struct v4l2_requestbuffers rq = { .count = ENC_IN_BUFS, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_USERPTR };
+    if (xioctl(s_u.enc_fd, VIDIOC_REQBUFS, &rq) != 0) {
+        ESP_LOGE(TAG, "enc REQBUFS OUT 失败 errno=%d", errno);
+        goto fail;
+    }
     struct v4l2_requestbuffers rc = { .count = ENC_OUT_BUFS, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
-    ESP_RETURN_ON_ERROR(xioctl(s_u.enc_fd, VIDIOC_REQBUFS, &rc) ? ESP_FAIL : ESP_OK, TAG, "enc REQBUFS CAP");
+    if (xioctl(s_u.enc_fd, VIDIOC_REQBUFS, &rc) != 0) {
+        ESP_LOGE(TAG, "enc REQBUFS CAP 失败 errno=%d", errno);
+        goto fail;
+    }
 
     xQueueReset(s_u.enc_free_in);
     for (int i = 0; i < ENC_IN_BUFS; i++) {
-        struct v4l2_buffer buf = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_MMAP, .index = i };
-        ESP_RETURN_ON_ERROR(xioctl(s_u.enc_fd, VIDIOC_QUERYBUF, &buf) ? ESP_FAIL : ESP_OK, TAG, "enc QUERYBUF OUT");
-        s_u.enc_in[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_u.enc_fd, buf.m.offset);
-        s_u.enc_in[i].length = buf.length;
-        ESP_RETURN_ON_FALSE(s_u.enc_in[i].start != MAP_FAILED, ESP_FAIL, TAG, "enc mmap OUT");
+        /* USERPTR：自有 PSRAM 缓冲（esp_video uvc 示例同款）。对齐 4096 + 尾部余量，
+         * 覆盖 jpeg 引擎 info->align_size / info->size 的内部对齐要求 */
+        s_u.enc_in[i].start = heap_caps_aligned_alloc(4096, (size_t)w * h * 2 + 4096,
+                                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_u.enc_in[i].start) {
+            ESP_LOGE(TAG, "enc IN[%d] PSRAM 分配失败", i);
+            goto fail;
+        }
+        s_u.enc_in[i].length = (size_t)w * h * 2 + 4096;
         xQueueSend(s_u.enc_free_in, &i, 0);
     }
     for (int i = 0; i < ENC_OUT_BUFS; i++) {
         struct v4l2_buffer buf = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP, .index = i };
-        ESP_RETURN_ON_ERROR(xioctl(s_u.enc_fd, VIDIOC_QUERYBUF, &buf) ? ESP_FAIL : ESP_OK, TAG, "enc QUERYBUF CAP");
-        s_u.enc_out[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_u.enc_fd, buf.m.offset);
+        if (xioctl(s_u.enc_fd, VIDIOC_QUERYBUF, &buf) != 0 ||
+            (s_u.enc_out[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                         s_u.enc_fd, buf.m.offset)) == MAP_FAILED) {
+            ESP_LOGE(TAG, "enc OUT[%d] QUERYBUF/mmap 失败 errno=%d", i, errno);
+            goto fail;
+        }
         s_u.enc_out[i].length = buf.length;
-        ESP_RETURN_ON_FALSE(s_u.enc_out[i].start != MAP_FAILED, ESP_FAIL, TAG, "enc mmap CAP");
         xioctl(s_u.enc_fd, VIDIOC_QBUF, &buf);
     }
     uint32_t t_out = V4L2_BUF_TYPE_VIDEO_OUTPUT, t_cap = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ESP_RETURN_ON_ERROR(xioctl(s_u.enc_fd, VIDIOC_STREAMON, &t_out) ? ESP_FAIL : ESP_OK, TAG, "enc STREAMON OUT");
-    ESP_RETURN_ON_ERROR(xioctl(s_u.enc_fd, VIDIOC_STREAMON, &t_cap) ? ESP_FAIL : ESP_OK, TAG, "enc STREAMON CAP");
+    if (xioctl(s_u.enc_fd, VIDIOC_STREAMON, &t_out) != 0 ||
+        xioctl(s_u.enc_fd, VIDIOC_STREAMON, &t_cap) != 0) {
+        ESP_LOGE(TAG, "enc STREAMON 失败 errno=%d", errno);
+        goto fail;
+    }
+    ESP_LOGI(TAG, "encoder_open OK");
     return ESP_OK;
+fail:
+    encoder_close();
+    return ESP_FAIL;
 }
 
 /* ---------- 档位选择：返回 frame_info 下标；-1 = 不支持 ---------- */
 static int pick_native(bool mjpeg_only, int want_w, int want_h)
 {
     int fallback = -1;      /* 未指定分辨率时的默认档 */
+    int fallback_640 = -1;  /* 未指定时优先 640x480（与 DVP 对比口径一致，PSRAM 友好） */
     int scalable = -1;      /* 重编码可缩放达标的档 */
     for (size_t i = 0; i < s_u.frame_info_n; i++) {
         uvc_host_frame_info_t *fi = &s_u.frame_info[i];
@@ -442,6 +483,7 @@ static int pick_native(bool mjpeg_only, int want_w, int want_h)
         if (!mjpeg_only && fi->format != UVC_VS_FORMAT_YUY2) continue;
         if (want_w <= 0 || want_h <= 0) {
             if (fallback < 0) fallback = i;
+            if (fi->h_res == 640 && fi->v_res == 480) fallback_640 = i;
             continue;
         }
         if (fi->h_res == want_w && fi->v_res == want_h) return i;   /* 原生精确优先 */
@@ -452,34 +494,70 @@ static int pick_native(bool mjpeg_only, int want_w, int want_h)
             scalable = i;
         }
     }
+    if (fallback_640 >= 0) return fallback_640;
     if (fallback >= 0 && (want_w <= 0 || want_h <= 0)) return fallback;
     return scalable;
 }
 
-/* ---------- 清理：顺序敏感（先暂停流 → 归还全部帧 → 关流 → 关编码器） ---------- */
+static esp_err_t try_open_stream_on_index(uint8_t stream_idx);   /* 定义于 open_stream_locked 之后 */
+
+/* ---------- 清理：顺序敏感（先暂停流 → 归还全部帧 → 关流 → 关编码器） ----------
+ * ★ s_u.stream 必须在 close 成功之后才能置 NULL：worker 的停止态排水循环用
+ *   s_u.stream 归还漏网帧（pause 前在途回调的竞态帧）。提前置 NULL 会让 worker
+ *   丢弃该帧 → 驱动 "Not all frames are returned" → close 永久失败 → 流泄漏
+ *   → 接口被占 → 之后所有 get_frame_list/open 永久失败（真机实测 2026-10-08）。 */
+static int drain_work_queue(uvc_host_stream_hdl_t h)
+{
+    uvc_host_frame_t *f;
+    int n = 0;
+    while (xQueueReceive(s_u.work_q, &f, 0) == pdTRUE) {
+        if (h) uvc_host_frame_return(h, f);
+        n++;
+    }
+    return n;
+}
+
 static void teardown_stream(void)
 {
+    ESP_LOGW(TAG, "teardown_stream 被调用（stream=%d want=%d）",
+             s_u.stream ? 1 : 0, (int)s_u.want_stream);
     s_u.worker_run = false;
     if (s_u.stream) {
         uvc_host_stream_hdl_t h = s_u.stream;
         /* 先暂停（无新帧、无回调）。活设备走控制传输；死设备报错——两种情况都忽略返回值，
          * 断线场景 uvc_host 的 DEV_GONE 处理里已经 pause 过 */
         uvc_host_stream_stop(h);
-        /* 排空队列，把所有帧归还驱动（stream_close 要求全部归还） */
-        uvc_host_frame_t *f;
-        while (xQueueReceive(s_u.work_q, &f, 0) == pdTRUE) {
-            uvc_host_frame_return(h, f);
-        }
-        /* 等 worker 处理完手中帧（含编码，最长约 50 ms；编码 DQBUF 有 200 ms 超时兜底） */
+        /* 等 worker 处理完手中帧（含编码，最长约 50 ms；编码 DQBUF 有 200 ms 超时兜底）。
+         * 先等 busy 再 drain：worker 手中帧归还路径用的是它自己取的 h，与队列无关 */
         int wait = 0;
         while (s_u.worker_busy && wait++ < 100) vTaskDelay(pdMS_TO_TICKS(10));
 
-        s_u.stream = NULL;
         s_u.stream_up = false;
-        for (int i = 0; i < 5; i++) {
-            if (uvc_host_stream_close(h) == ESP_OK) break;
-            vTaskDelay(pdMS_TO_TICKS(200));
+        /* 多轮排空 + close 重试：pause 前在途的 driver 回调可能在 stop 返回后才把
+         * 竞态帧送进队列；worker 排水循环也会把它归还驱动。close 要求全部归还，
+         * 每轮重试前再 drain 兜底 */
+        bool closed = false;
+        for (int i = 0; i < 10 && !closed; i++) {
+            int leaked = drain_work_queue(h);
+            if (leaked) {
+                ESP_LOGW(TAG, "teardown：第 %d 轮追回 %d 个竞态帧", i, leaked);
+                vTaskDelay(pdMS_TO_TICKS(30));   /* 给 worker 排水循环时间再捞一轮 */
+                continue;
+            }
+            esp_err_t err = uvc_host_stream_close(h);
+            if (err == ESP_OK) {
+                closed = true;
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
         }
+        if (!closed) {
+            /* 极端场景（设备半死 + 帧卡死）：放弃 close，流对象泄漏但记录在案；
+             * 设备重插后驱动侧 DEV_GONE 会强制回收该流 */
+            ESP_LOGE(TAG, "stream_close 10 轮仍失败（帧未归还）——流对象可能泄漏，"
+                     "若反复出现请重新插拔摄像头");
+        }
+        s_u.stream = NULL;   /* ★ close 之后才置 NULL */
     } else {
         s_u.stream_up = false;
     }
@@ -490,7 +568,48 @@ static esp_err_t open_stream_locked(void)
 {
     if (!s_u.dev_present) return ESP_ERR_NOT_FOUND;
 
+    /* 部分 UVC 设备有多个流索引（复合 function），仅其一可用：逐个尝试直到
+     * open+start 成功（协商控制传输超时 = 该 function 是哑通道，换下一个） */
+    for (int cand = 0; cand < s_u.idx_cand_n; cand++) {
+        esp_err_t err = try_open_stream_on_index(s_u.idx_candidates[cand]);
+        if (err == ESP_OK) return ESP_OK;
+        if (err == ESP_ERR_NOT_SUPPORTED) return err;   /* 档位问题：换索引也无解 */
+        ESP_LOGW(TAG, "流索引 %u 打开失败（%s），尝试下一个候选",
+                 s_u.idx_candidates[cand], esp_err_to_name(err));
+    }
+    return ESP_FAIL;
+}
+
+/* 帧率选择：≤640x480 传 0（设备默认=最高档，本机 640@60 实测满帧）；更大档位
+ * 选 ≤30fps 的最大档——720p@60 的持续码率（~12Mbps）会打满 20MHz Wi-Fi 链路，
+ * 连 httpd 都被挤死（真机实测 2026-10-08）。
+ * ★ 显式 fps 必须与驱动同源计算（10000000.0f/interval 的浮点值）：驱动的
+ *   uvc_desc_format_is_equal 用 FLOAT_EQUAL(eps=1e-4) 与描述符换算值比较——
+ *   传整数 60.0f 对 166667（=59.99988f）差 2.4e-4 会匹配失败；同源计算则逐位相等。 */
+static float pick_tier_fps(const uvc_host_frame_info_t *fi)
+{
+    if ((int)fi->h_res * (int)fi->v_res <= 640 * 480) return 0.0f;   /* 默认即最高帧率 */
+    float best = 0.0f;
+    for (int j = 0; j < fi->interval_type && j < 8; j++) {
+        float f = 10000000.0f / (float)fi->interval[j];   /* 与驱动 UVC_DESC_DWFRAMEINTERVAL_TO_FPS 同源 */
+        if (f > 0.5f && f <= 30.0f + 0.5f && f > best) best = f;
+    }
+    return best;   /* 0 = 无 ≤30fps 档时退回设备默认 */
+}
+
+/* 在指定 UVC 流索引上完成 取档位表 → 选档 → open → start（→ 编码器） */
+static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
+{
     bool passthrough = (s_u.mode == USB_MODE_PASSTHROUGH);
+
+    /* 每个索引的档位表可能不同：先取该索引的 */
+    size_t cap = sizeof(s_u.frame_info) / sizeof(s_u.frame_info[0]);
+    s_u.frame_info_n = 0;
+    ESP_RETURN_ON_ERROR(uvc_host_get_frame_list(s_u.dev_addr, stream_idx,
+                                                (uvc_host_frame_info_t (*)[])s_u.frame_info, &cap),
+                        TAG, "get_frame_list idx=%u", stream_idx);
+    s_u.frame_info_n = cap;
+
     int idx = pick_native(passthrough, s_u.req_w, s_u.req_h);
     if (idx < 0) {
         ESP_LOGE(TAG, "%s 模式下不支持 %dx%d（见档位列表）",
@@ -508,9 +627,9 @@ static esp_err_t open_stream_locked(void)
         .frame_cb = frame_cb,
         .user_ctx = NULL,
         .usb = { .dev_addr = s_u.dev_addr, .vid = UVC_HOST_ANY_VID, .pid = UVC_HOST_ANY_PID,
-                 .uvc_stream_index = s_u.stream_index },
+                 .uvc_stream_index = stream_idx },
         .vs_format = { .h_res = fi->h_res, .v_res = fi->v_res,
-                       .fps = 0,   /* 0 = 摄像头默认帧间隔 */
+                       .fps = pick_tier_fps(fi),   /* 同源浮点帧率；0=设备默认 */
                        .format = fi->format },
         .advanced = {
             .number_of_frame_buffers = FRAME_BUFFERS,
@@ -547,16 +666,19 @@ static esp_err_t open_stream_locked(void)
         }
     }
 
+    s_u.stream_index = stream_idx;
     s_u.w = fi->h_res;
     s_u.h = fi->v_res;
     s_u.out_w = out_w;
     s_u.out_h = out_h;
     s_u.next_due_us = 0;
+    rebuild_tiers();   /* ★ 必须先于 stream_up=true：switch 返回后上层立即查档位表 */
     s_u.stream_up = true;
     s_u.worker_run = true;
     xQueueReset(s_u.work_q);
     bool scaled = (out_w != fi->h_res || out_h != fi->v_res);
-    ESP_LOGI(TAG, "UVC 推流开始：%s %ux%u%s%s quality=%u fps_limit=%d",
+    ESP_LOGI(TAG, "UVC 推流开始（流索引 %u）：%s %ux%u%s%s quality=%u fps_limit=%d",
+             stream_idx,
              fmt_enum_name(fi->format), fi->h_res, fi->v_res,
              scaled ? " → " : "", scaled ? "ESP32缩放" : "",
              passthrough ? 0 : s_u.quality, s_u.fps_limit);
@@ -569,12 +691,13 @@ static void worker_task(void *arg)
     uvc_host_frame_t *f;
     for (;;) {
         if (!s_u.worker_run) {
-            /* 停止态：归还队列中所有帧（teardown 已先排空过，这里兜底竞态余量） */
+            /* 停止态：teardown 的 close 重试期间，把漏网的竞态帧归还驱动
+             * （s_u.stream 在 close 成功前保持有效——见 teardown_stream 注释） */
             uvc_host_stream_hdl_t h = s_u.stream;
             while (xQueueReceive(s_u.work_q, &f, 0) == pdTRUE) {
                 if (h) uvc_host_frame_return(h, f);
             }
-            vTaskDelay(pdMS_TO_TICKS(20));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
         if (xQueueReceive(s_u.work_q, &f, pdMS_TO_TICKS(200)) != pdTRUE) continue;
@@ -624,9 +747,23 @@ static void worker_task(void *arg)
             size_t out_bytes = MIN((size_t)s_u.out_w * s_u.out_h * 2, s_u.enc_in[idx].length);
             fill_encoder_input(s_u.enc_in[idx].start, f->data,
                                s_u.w, s_u.h, s_u.out_w, s_u.out_h, kx, ky, x0, y0, t_arr);
-            struct v4l2_buffer vb = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_MMAP,
+            struct v4l2_buffer vb = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_USERPTR,
                                       .index = idx, .bytesused = out_bytes };
+            vb.m.userptr = (unsigned long)s_u.enc_in[idx].start;
+            vb.length = s_u.enc_in[idx].length;
+            {
+                static int dbg_q;
+                if (++dbg_q <= 3)
+                    ESP_LOGW(TAG, "QBUF(OUT) idx=%d userptr=%p(%%4k=%u) len=%u bytesused=%u",
+                             idx, s_u.enc_in[idx].start,
+                             (unsigned)((uintptr_t)s_u.enc_in[idx].start % 4096),
+                             (unsigned)vb.length, (unsigned)vb.bytesused);
+            }
             if (xioctl(s_u.enc_fd, VIDIOC_QBUF, &vb) != 0) {
+                static uint32_t qbuf_err;
+                if (++qbuf_err % 30 == 1)
+                    ESP_LOGW(TAG, "enc QBUF(OUTPUT) 失败 errno=%d out_bytes=%u in_len=%u",
+                             errno, (unsigned)out_bytes, (unsigned)s_u.enc_in[idx].length);
                 xQueueSend(s_u.enc_free_in, &idx, 0);
                 s_u.stats.cap_drops++;
                 uvc_host_frame_return(h, f);
@@ -635,6 +772,20 @@ static void worker_task(void *arg)
             }
             struct v4l2_buffer ob = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
             bool enc_ok = xioctl(s_u.enc_fd, VIDIOC_DQBUF, &ob) == 0;   /* M2M：DQBUF 内同步编码 */
+            if (!enc_ok) {
+                static uint32_t dqbuf_err;
+                if (++dqbuf_err % 30 == 1)
+                    ESP_LOGW(TAG, "enc DQBUF(CAPTURE) 失败 errno=%d（200ms 超时？）", errno);
+            }
+            /* ★ DQBUF(OUTPUT)：取回被消费的输入槽，元素回到 FREE 态。
+             *   缺此步则元素永久 ALLOCATED，同槽第二次 QBUF 报 EINVAL
+             *   （与 camera_pipeline 的 encode_task 中 DQBUF(OUTPUT) 同款必做步骤） */
+            struct v4l2_buffer ob_in = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT, .memory = V4L2_MEMORY_USERPTR };
+            if (xioctl(s_u.enc_fd, VIDIOC_DQBUF, &ob_in) != 0) {
+                static uint32_t din_err;
+                if (++din_err % 30 == 1)
+                    ESP_LOGW(TAG, "enc DQBUF(OUTPUT) 失败 errno=%d", errno);
+            }
             uint64_t t_enc = esp_timer_get_time();
             xQueueSend(s_u.enc_free_in, &idx, 0);
             uvc_host_frame_return(h, f);
@@ -658,13 +809,39 @@ static void worker_task(void *arg)
     }
 }
 
-/* ---------- monitor：USB 总线事件泵 + 状态机 + 自动重连（U5） ---------- */
-static void monitor_task(void *arg)
+/* lib 事件泵：必须独占常驻（IDF v6 usbh 的传输完成事件经 lib 队列派发给各 client；
+ * 若在状态机任务里附带泵送，任何一次阻塞（如 stream_open 等控制传输）都会冻结全总线
+ * 的事件派发 —— 真机表现为 uvc_host_usb_ctrl CTRL timeout，官方示例同款独立任务） */
+static void usb_lib_task(void *arg)
 {
     uint32_t flags;
+    uint32_t iters = 0;
+    while (1) {
+        esp_err_t err = usb_host_lib_handle_events(portMAX_DELAY, &flags);
+        iters++;
+        if (flags) {
+            ESP_LOGW(TAG, "lib evt=0x%x iter=%u", (unsigned)flags, (unsigned)iters);
+        }
+        static uint64_t last_hb;
+        uint64_t now = esp_timer_get_time();
+        if (now - last_hb > 5000000) {
+            ESP_LOGI(TAG, "usb_lib 心跳：iter=%u err=%s", (unsigned)iters, esp_err_to_name(err));
+            last_hb = now;
+        }
+    }
+}
+
+/* ---------- monitor：client 事件派发 + 状态机 + 自动重连（U5） ---------- */
+static void monitor_task(void *arg)
+{
     for (;;) {
-        usb_host_lib_handle_events(pdMS_TO_TICKS(50), &flags);
         usb_host_client_handle_events(s_u.client, 0);   /* 非阻塞派发 NEW_DEV/DEV_GONE */
+        static uint64_t last_hb;
+        if (esp_timer_get_time() - last_hb > 5000000) {
+            ESP_LOGI(TAG, "monitor 心跳：dev=%d stream=%d want=%d",
+                     (int)s_u.dev_present, (int)s_u.stream_up, (int)s_u.want_stream);
+            last_hb = esp_timer_get_time();
+        }
 
         if (s_u.teardown_req) {
             s_u.teardown_req = false;
@@ -735,6 +912,8 @@ esp_err_t source_usb_init(void)
     };
     ESP_RETURN_ON_ERROR(uvc_host_install(&drv_config), TAG, "uvc_host_install");
 
+    if (xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 3072, NULL, 6, NULL, 0) != pdPASS)
+        return ESP_ERR_NO_MEM;
     if (xTaskCreatePinnedToCore(worker_task, "usb_work", 6144, NULL, 13, NULL, 1) != pdPASS)
         return ESP_ERR_NO_MEM;
     if (xTaskCreatePinnedToCore(monitor_task, "usb_mon", 4096, NULL, 4, NULL, 0) != pdPASS)
@@ -808,18 +987,25 @@ esp_err_t source_usb_apply(int w, int h, uint8_t quality, int fps_limit)
     }
     if (fps_limit >= 0) s_u.fps_limit = fps_limit;
 
-    /* 分辨率变化需要重新协商流（直通必须原生精确；重编码经缩放） */
+    /* 分辨率变化需要重新协商流（直通必须原生精确；重编码经缩放）。
+     * 同步执行：teardown + 设置参数 + 直开（不经 monitor 异步，消灭竞态） */
     bool res_change = (w && h) && (w != s_u.out_w || h != s_u.out_h);
     if (res_change) {
-        source_usb_set_active(false);
+        s_u.want_stream = false;
+        s_u.teardown_req = false;
+        xSemaphoreTake(s_u.lock, portMAX_DELAY);
+        teardown_stream();
         s_u.req_w = w;
         s_u.req_h = h;
-        source_usb_set_active(true);
-        for (int i = 0; i < 150 && !s_u.stream_up; i++) {
-            if (!s_u.dev_present) return ESP_ERR_NOT_FOUND;
-            vTaskDelay(pdMS_TO_TICKS(20));
+        esp_err_t err = ESP_OK;
+        if (s_u.dev_present) {
+            err = open_stream_locked();
+        } else {
+            err = ESP_ERR_NOT_FOUND;
         }
-        if (!s_u.stream_up) return ESP_FAIL;
+        xSemaphoreGive(s_u.lock);
+        s_u.want_stream = true;   /* 恢复活动（失败时 monitor 会按 want 重试） */
+        if (err != ESP_OK) return err;
     }
     return ESP_OK;
 }
@@ -882,7 +1068,9 @@ frame_ring_t *source_usb_ring(void) { return cam_pipe_ring(); }
 
 int source_usb_supported_res(char *out, size_t outlen)
 {
-    /* 当前模式下的可用档：直通=MJPEG 原生精确档；重编码=YUY2 原生 + 可缩放的虚拟档 */
+    /* 当前模式下的可用档：直通=MJPEG 原生精确档；重编码=YUY2 原生 + 可缩放的虚拟档。
+     * ★ 取锁：rebuild_tiers() 在流打开路径清零重填档位表，无锁会读到中间态 */
+    xSemaphoreTake(s_u.lock, portMAX_DELAY);
     int n = 0;
     out[0] = 0;
     bool passthrough = (s_u.mode == USB_MODE_PASSTHROUGH);
@@ -896,39 +1084,52 @@ int source_usb_supported_res(char *out, size_t outlen)
         strlcat(out, item, outlen);
         n++;
     }
-    if (passthrough) return n;
-    /* 重编码：补齐可由 YUY2 原生档缩放得到的标准虚拟档 */
-    static const int tiers[][2] = { {160,120},{320,240},{480,320},{640,480} };
-    for (size_t t = 0; t < sizeof(tiers) / sizeof(tiers[0]); t++) {
-        for (int i = 0; i < s_u.tier_n; i++) {
-            usb_tier_t *ti = &s_u.tiers[i];
-            if (ti->mjpeg) continue;
-            int kx, ky, x0, y0;
-            if (!plan_virtual(ti->w, ti->h, tiers[t][0], tiers[t][1], &kx, &ky, &x0, &y0)) continue;
-            char item[16];
-            snprintf(item, sizeof(item), "%dx%d", tiers[t][0], tiers[t][1]);
-            if (strstr(out, item)) continue;
-            if (n) strlcat(out, ",", outlen);
-            strlcat(out, item, outlen);
-            n++;
-            break;
+    if (!passthrough) {
+        /* 重编码：补齐可由 YUY2 原生档缩放得到的标准虚拟档 */
+        static const int tiers[][2] = { {160,120},{320,240},{480,320},{640,480} };
+        for (size_t t = 0; t < sizeof(tiers) / sizeof(tiers[0]); t++) {
+            for (int i = 0; i < s_u.tier_n; i++) {
+                usb_tier_t *ti = &s_u.tiers[i];
+                if (ti->mjpeg) continue;
+                int kx, ky, x0, y0;
+                if (!plan_virtual(ti->w, ti->h, tiers[t][0], tiers[t][1], &kx, &ky, &x0, &y0)) continue;
+                char item[16];
+                snprintf(item, sizeof(item), "%dx%d", tiers[t][0], tiers[t][1]);
+                if (strstr(out, item)) continue;
+                if (n) strlcat(out, ",", outlen);
+                strlcat(out, item, outlen);
+                n++;
+                break;
+            }
         }
     }
+    xSemaphoreGive(s_u.lock);
     return n;
 }
 
 bool source_usb_res_supported(int w, int h)
 {
+    xSemaphoreTake(s_u.lock, portMAX_DELAY);
     for (int i = 0; i < s_u.tier_n; i++) {
         usb_tier_t *t = &s_u.tiers[i];
         if (s_u.mode == USB_MODE_PASSTHROUGH) {
-            if (t->mjpeg && t->w == w && t->h == h) return true;
+            if (t->mjpeg && t->w == w && t->h == h) {
+                xSemaphoreGive(s_u.lock);
+                return true;
+            }
         } else if (!t->mjpeg) {
             int kx, ky, x0, y0;
-            if (t->w == w && t->h == h) return true;
-            if (plan_virtual(t->w, t->h, w, h, &kx, &ky, &x0, &y0)) return true;
+            if (t->w == w && t->h == h) {
+                xSemaphoreGive(s_u.lock);
+                return true;
+            }
+            if (plan_virtual(t->w, t->h, w, h, &kx, &ky, &x0, &y0)) {
+                xSemaphoreGive(s_u.lock);
+                return true;
+            }
         }
     }
+    xSemaphoreGive(s_u.lock);
     return false;
 }
 
@@ -952,20 +1153,23 @@ esp_err_t source_usb_set_mode(usb_mode_t m)
     usb_mode_t old = s_u.mode;
     s_u.mode = m;
     if (was_active && s_u.dev_present) {
-        source_usb_set_active(false);
-        s_u.next_retry_us = 0;
-        source_usb_set_active(true);
-        for (int i = 0; i < 150 && !s_u.stream_up; i++) vTaskDelay(pdMS_TO_TICKS(20));
-        if (!s_u.stream_up) {
-            /* 新模式失败 → 回滚旧模式（保持可用而非死机） */
-            ESP_LOGW(TAG, "切换到 %s 失败，回滚 %s", 
+        /* 同步重开（不经 monitor 异步）：新模式失败回滚旧模式 */
+        s_u.want_stream = false;
+        s_u.teardown_req = false;
+        xSemaphoreTake(s_u.lock, portMAX_DELAY);
+        teardown_stream();
+        esp_err_t err = open_stream_locked();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "切换到 %s 失败（%s），回滚 %s",
                      m == USB_MODE_PASSTHROUGH ? "passthrough" : "reencode",
+                     esp_err_to_name(err),
                      old == USB_MODE_PASSTHROUGH ? "passthrough" : "reencode");
             s_u.mode = old;
-            s_u.next_retry_us = 0;
-            source_usb_set_active(true);
-            return ESP_FAIL;
+            err = open_stream_locked();   /* 尽力回滚 */
         }
+        xSemaphoreGive(s_u.lock);
+        s_u.want_stream = true;
+        return err;
     }
     return ESP_OK;
 }
@@ -975,8 +1179,10 @@ const char *source_usb_device_name(void) { return s_u.dev_name; }
 
 int source_usb_get_tiers(usb_tier_t *out, int max)
 {
+    xSemaphoreTake(s_u.lock, portMAX_DELAY);
     int n = s_u.tier_n < max ? s_u.tier_n : max;
     memcpy(out, s_u.tiers, n * sizeof(usb_tier_t));
+    xSemaphoreGive(s_u.lock);
     return n;
 }
 

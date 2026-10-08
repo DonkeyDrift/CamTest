@@ -55,7 +55,7 @@ typedef struct {
     ts_meaning_t ts_meaning;
     int      nominal_fps;          /* 描述符/格式表标称帧率 */
     int      fps_limit;            /* 软件帧率上限（0=不限） */
-    char     pix_fmt_str[8];       /* 实际出帧像素格式（"YUYV"/"JPEG"/"RGB565"…；直通=摄像头内部 JPEG） */
+    char     pix_fmt_str[12];       /* 实际出帧像素格式（"YUYV"/"JPEG"/"RGB565"…；直通=摄像头内部 JPEG） */
     char     sensor_name[SRC_SENSOR_NAME_MAX];  /* "OV3660"/"SC101IOT"/USB "vid:pid" */
     char     usb_device_name[SRC_USB_NAME_MAX]; /* 非 USB 源为 "" */
     char     fmt_name[SRC_FMT_NAME_MAX];

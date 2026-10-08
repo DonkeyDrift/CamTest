@@ -241,12 +241,27 @@ OV3660 仅 240×240@24 与 640×480@10（YUYV/RGB565）——矩阵中其余档�
 | `usb_host_uvc` 组件与 S31 | ✅ espressif/usb_host_uvc **2.5.2**（esp-usb 仓库 `host/class/uvc/usb_host_uvc`），targets 显式含 `esp32s31`；esp_video 2.2.0 的组件清单对 esp32p4/s3/s31 固定依赖 `usb_host_uvc 2.5.*`，`dependencies.lock` 已解析 2.5.2 + espressif/usb 1.5.0（`usb_host_install` 的 `peripheral_map=0` 在 HS capable 目标默认走 High-Speed 外设） |
 | esp_video 的 `/dev/video40` V4L2 封装 | ⚠️ **存在但未采用**。esp_video 2.2.0 确有 `ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE`（设备号 40..49，`uvc_to_v4l2_format` 支持 MJPEG/YUY2），但其断线语义有缺陷：设备拔出后 `uvc_video_stop()`/`uvc_video_deinit()` 因 `dev_addr==0` **提前返回 `ESP_ERR_NOT_FOUND`** → `esp_video_close()` 不清 `inited` 标志、`uvc_host_stream_close()` 永不被调用 → **每次拔插泄漏一条 stream（URB 为内部 RAM）**；且 open 时会同步阻塞等待枚举（默认 10 s）。不满足"拔插 3 次不卡死、自动重连"的验收标准 |
 | 最终路线 | ✅ **按任务书预留的降级路线：直接使用 usb_host_uvc 原生 API**，封装进与 DVP 完全一致的采集源接口（`source_usb.c`）。其 `uvc_host_stream_close()` 对死设备容错（stop 的控制传输错误被忽略，全部帧归还后 `uvc_device_remove()` 释放 stream+URB），断线可干净回收。esp_video 的 UVC Kconfig 保持关闭（`sdkconfig.defaults` 显式 `is not set`），避免双重 `usb_host_install` |
+| **真机验证（2026-10-07，0bda:1376 摄像头）** | ✅ 枚举→12 档清单打印→两模式推流→UI 热切换全部通过。USB passthrough 640×480 实测 **54.8fps**（@60fps 档，零丢帧）/13~15fps（@实际曝光）；reencode YUY2→硬件 JPEG **5fps**（YUY2@10fps 档）quality 可控。调试中定位并修复 4 个集成坑（见下「工程实录」） |
 | 设备识别 | `usb_host_device_open()` + `usb_host_get_device_descriptor()` 取 VID/PID（UI/CSV 显示 `vid:pid`，如 `1bcf:28c4`）。usb 1.5.0 **无字符串描述符公共 API**，iProduct 产品名暂不取（见待核实清单 #9） |
 | 档位枚举 | `uvc_host_get_frame_list(dev_addr, stream_idx, ...)` 直接返回描述符解析后的 (格式， 分辨率， 帧间隔) 全表——启动/插入即打印完整清单并生成 UI 档位列表 |
 
 > 真机最小验证（枚举/取帧/帧长/实测帧率）需在板上进行：烧录后插 USB 摄像头，
 > 串口即打印上述清单与 `UVC 推流开始`，Web UI 显示画面即为通过。接口层已按
 > 官方 `basic_uvc_stream` 示例的调用序列编写（open→format_select(fps=0 默认)→start）。
+
+### 1.5 工程实录：USB 通路集成踩坑与修复（真机调试结论，全部已修复）
+
+| # | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | 插入摄像头枚举失败：`Configuration descriptor larger than control transfer max length` | `CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE` 默认 256 < UVC 配置描述符（本机 799B） | sdkconfig 提到 **1024** |
+| 2 | stream_open 的 VS Probe 控制传输 5s 超时（连带一切控制传输卡死） | `usb_host_lib_handle_events()` 必须常驻独立任务泵送——IDF v6 usbh 的传输完成事件经 **lib 事件队列**派发；并进状态机任务后，任何一次阻塞（如 stream_open 等待）就冻结全总线派发 | 独立 `usb_lib_task`（官方示例同款） |
+| 3 | reencode 模式第 3 帧起编码器 QBUF 全部 EINVAL（`element not free`） | M2M 编码器每帧必须 `DQBUF(OUTPUT)` 取回被消费的输入槽（元素才回 FREE 态）——漏写即永久占用 | worker 补上（与 camera_pipeline 的 encode_task 同款） |
+| 4 | USB 推流时 /api/status 挂死（小端点正常、大端点超时） | 两个档位查询函数加锁补丁半途失败：一处 **return 未还锁**（锁永久泄漏）+ 一处 **无 take 却 give**（互斥量破坏） | 重写两函数，take/give 全路径配平 |
+| 5 | 摄像头 720p@60 档持续 `frame error`（摄像头自带错误帧标记） | 该档 isoc 带宽吃紧（dwMaxVideoFrameSize 虚标 1.8MB），属摄像头 quirks | 默认档选 640×480（@60 实测稳定零丢帧）；720p 可用但建议 fps_limit 限 30 |
+| 6 | **分辨率切换一次失败后 USB 永久打不开**（get_frame_list 持续 `ESP_ERR_INVALID_ARG`） | teardown 在 close 成功前置 `stream=NULL` → worker 停止态排水捞到 pause 前在途回调的竞态帧时句柄已空 → 帧被丢弃永不归还 → 驱动 "Not all frames are returned" → close 永久失败 → 流对象泄漏占住接口 | 句柄生命周期延长到 close 成功；close 重试（10 轮）每轮前重新 drain，配合 worker 排水把竞态帧归还驱动；修复后 30 次连续切换（320/640/720/176/352 混合 + 源往返）零失败 |
+| 7 | 720p@60 持续码率 ~12Mbps 时 **httpd 被挤死**（POST 超时/连接 reset），TCP 到达仅 24fps | 20MHz Wi-Fi 链路过载 + LWIP TCP 窗口 23KB 卡带宽延迟积 | 大于 640×480 的档位自动限 30fps（fps 传值与驱动**同源浮点计算**，避开 FLOAT_EQUAL 精度坑：整数 60.0f 对 166667→59.99988f 差 2.4e-4 不匹配）；TCP SND/WND 23392→49152 |
+
+另：显式指定帧率（如 60.0f）在 `uvc_claim_interface` 的描述符匹配中失败过一次（驱动按 `10e6/interval` 的浮点值匹配），故统一传 fps=0 用设备默认帧间隔。
 
 ### 2. 两种工作模式（U2，数据中必须区分）
 
@@ -416,6 +431,20 @@ DVP 与 USB UVC 可运行时热切换（`POST /api/config {"source":"usb"|"dvp"}
 ## 九、结果
 
 见 `RESULTS_TEMPLATE.md`（回填模板 + 指标口径）。扫描产物一键导出 `/api/scan/csv`。
+
+### USB UVC 通路实测（2026-10-07 首轮真机，摄像头 0bda:1376，仅枚举/直通/重编码功能验证；完整 DVP vs USB 对比待按模板复测）
+
+| 项 | 值 | 口径 |
+|---|---|---|
+| 枚举 | 12 档：MJPEG 1280×720/800×600/640×480/352×288/320×240/176×144 @60/30/25fps；YUY2 同分辨率 @10fps | 描述符实测（串口完整打印） |
+| USB passthrough 320×240@60 | 设备 cap **59.8~60.0fps**；HTTP 到达 **46~54fps**（间隔 p95=1 帧） | 实测 2026-10-08 |
+| USB passthrough 640×480@60 | 设备 cap **60.0fps** 满帧（URB 扩容 4→8 后由 54.8 提升）；HTTP 到达 **40.7~45.5fps**（TCP 窗口 48KB 后由 24.7 提升；间隔 p95=2 帧）；室内弱光自动曝光降至 13~15fps 属摄像头行为 | 实测 2026-10-08 |
+| USB passthrough 1280×720@30 | 设备 cap 24.9~30.0fps（大档自动限 30fps，见工程实录 #7）；HTTP 到达 22fps；60fps 档会挤死 httpd 不再使用 | 实测 2026-10-08 |
+| 分辨率切换压力 | 30 次连续切换（320/640/720/176/352 混合 + DVP↔USB 源往返，含拉流客户端活跃场景）**零失败** | 实测 2026-10-08 |
+| USB reencode 640×480 q20/q30 | 5.0fps 编码发布（YUY2@10fps 档）、9.2~10.5 kB/帧、CPU 5~7/24%、零丢帧 | 设备侧，实测 |
+| UI 热切换 | DVP↔USB 下拉即切、失败回滚、流客户端不断流；连续 6 次往返无重启 | 实测 |
+| 摄像头内部固有延迟 | **未标定**（需按 §四点五.3 流程光学校准，≥10 采样） | 待测 |
+| DVP vs USB 时延对比 | **待数据**（需上述标定 + scope=both 扫描，模板已就绪） | 待测 |
 
 ### 已实测参考数据（2026-10-07，本仓库固件，HUAWEI-DKC 2.4G STA，11ax ch1 20MHz，RSSI −34~−40 dBm）
 

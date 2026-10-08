@@ -33,6 +33,10 @@ CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE=y
 # CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE is not set
 
 # ---- USB UVC（usb_host_uvc 2.5.2，热插拔）----
+# 控制传输缓冲：默认 256 字节装不下 UVC 摄像头的配置描述符（UVC 描述符 + 多 alt setting
+# 普遍 300~1500 字节），会报 "Configuration descriptor larger than control transfer max
+# length" 并导致枚举失败（真机实测 2026-10-07）
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
 # 每档离散帧间隔数组长度（部分摄像头列 30/25/20/15/10fps 多档，默认 3 不够）
 CONFIG_UVC_INTERVAL_ARRAY_SIZE=6
 # 枚举成功时打印完整配置描述符（验收要求：串口可见设备能力清单）
@@ -58,6 +62,10 @@ CONFIG_HTTPD_MAX_URI_HANDLERS=16
 
 # ---- 并发 socket（支持 2~3 个并发观看端 + 流服务）----
 CONFIG_LWIP_MAX_SOCKETS=24
+# TCP 收发缓冲：默认 5744B 太小——USB 高码率流（640@60≈15Mbps）下发送窗口卡带宽延迟积，
+# 到达帧率仅 24fps 且大 JSON 响应会被卡死（真机实测 2026-10-07/08）。48KB 后到达 45fps。
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=49152
+CONFIG_LWIP_TCP_WND_DEFAULT=49152
 
 # ---- 看门狗：MJPEG 长发送/编码阻塞较久，放宽任务级 WDT 到 10 s（理由见 README）----
 CONFIG_ESP_TASK_WDT_INIT=y

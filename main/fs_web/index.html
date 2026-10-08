@@ -583,7 +583,9 @@ function renderStatus(){
   tb.innerHTML=cl.length?cl.map(c=>`<tr><td>${c.type}</td><td>${c.ip}</td><td>${fmtN(c.fps,1)}</td><td>${fmtN(c.mbps,2)}Mbps</td></tr>`).join("")
     :"<tr><td colspan=4 style='text-align:center;color:var(--dim)'>—</td></tr>";
   // 控件不再回弹同步：改动即应用（见 init 的事件绑定），避免 500ms 轮询覆盖用户待生效的选择
-  // 扫描
+  // USB 面板 / 三段时延 / 扫描
+  renderUsb(usb, dev);
+  renderLatSeg(dev);
   renderScan(sc);
 }
 
@@ -643,20 +645,23 @@ function renderCompare(rows){
 /* ============================== 配置 ============================== */
 async function applyConfig(){
   const body={};
+  body.source=$("cSrc").value;                                   /* U1 采集源热切换 */
+  if(body.source==="usb") body.usb_mode=$("cUsbMode").value;     /* U2 直通/重编码 */
   body.res=$("cRes").value;
-  body.quality=+$("cQ").value;
+  if(body.source!=="usb"||$("cUsbMode").value==="reencode") body.quality=+$("cQ").value;
   body.fps_limit=+$("cFps").value;
   body.hifps=+$("cHfp").value;
   body.transport=$("cTr").value;
   body.overlay=$("cOv").checked;
   body.target_mbps=+$("cBr").value;
-  $("cfgMsg").textContent="应用中…";
+  $("cfgMsg").textContent="应用中…（切换采集源需 1~3 s）";
   try{
     const r=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     const j=await r.json();
     $("cfgMsg").textContent=j.ok?"已应用"+(j.restarted?"（链路已重建）":""):"失败："+(j.error||r.status);
     $("cfgMsg").style.color=j.ok?"var(--ok)":"var(--err)";
     if(j.ok&&j.transport!==S.transport){ S.transport=j.transport||body.transport; switchTransport(); }
+    if(j.ok) buildResOptions(j.source==="usb"?{source:"usb"}:{source:"dvp"});   /* 刷新原生/缩放标注 */
   }catch(e){ $("cfgMsg").textContent="请求失败："+e; $("cfgMsg").style.color="var(--err)"; }
 }
 function switchTransport(){
@@ -764,6 +769,8 @@ async function init(){
   $("bScanStop").onclick=stopScan;
   /* 改动即应用：消灭"选好未点应用被 500ms 轮询回弹"的竞态（扫描中禁用） */
   const autoApply=()=>{ if(!scanActive()) applyConfig(); };
+  $("cSrc").onchange=autoApply;        /* 采集源切换即应用（含回滚提示） */
+  $("cUsbMode").onchange=autoApply;    /* USB 模式切换即应用 */
   $("cRes").onchange=autoApply;
   $("cQ").onchange=autoApply;
   $("cHfp").onchange=autoApply;
