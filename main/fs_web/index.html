@@ -552,6 +552,9 @@ function renderStatus(){
   const d=S.status; if(!d) return;
   const dev=d.device||{}, wf=dev.wifi||{}, sc=d.scan||{}, usb=d.usb||{};
   S.usb=usb;
+  /* 支持档随采集源变化：列表变化时重建下拉（保持选中项），否则源切换后仍列旧源档位 */
+  const rsig=(dev.source||"")+"|"+((d.supported_res||[]).join(","));
+  if(rsig!==S.resOptSig){ S.resOptSig=rsig; buildResOptions({source:dev.source}); }
   banner(null);
   const srcName=dev.source==="usb"?("USB "+(dev.usb_device||"")):("DVP "+(dev.sensor||"?"));
   $("bSource").innerHTML="源 <b>"+srcName+"</b>"+(dev.scaled?"·缩放":"");
@@ -595,7 +598,14 @@ function buildResOptions(dev){
   const isUsb=dev&&dev.source==="usb";
   const native=new Set();
   if(isUsb&&S.usb&&S.usb.tiers) S.usb.tiers.forEach(t=>native.add(t.w+"x"+t.h));
+  const prev=$("cRes").value;
   $("cRes").innerHTML=sup.map(r=>`<option value="${r}">${r}${isUsb?(native.has(r)?"（原生）":"（缩放）"):""}</option>`).join("");
+  /* ★ innerHTML 重建会把选中项重置回第一项——必须恢复，否则每次应用后下拉
+     回弹到首项，下一次 applyConfig 会把首项分辨率误发给设备（分辨率"切不动"根因）。
+     当前档不在列表（跨源虚拟档）时追加"（当前）"选项，保证后续应用不改分辨率 */
+  const want=(dev&&dev.res)||prev;
+  if(want&&sup.includes(want)) $("cRes").value=want;
+  else if(want){ $("cRes").innerHTML+=`<option value="${want}">${want}（当前）</option>`; $("cRes").value=want; }
 }
 /* USB 面板 */
 function renderUsb(usb,dev){
@@ -654,14 +664,15 @@ async function applyConfig(){
   body.transport=$("cTr").value;
   body.overlay=$("cOv").checked;
   body.target_mbps=+$("cBr").value;
-  $("cfgMsg").textContent="应用中…（切换采集源需 1~3 s）";
+  $("cfgMsg").textContent="应用中…（链路重建约 2~8 s，多客户端时偏慢，画面会短暂暂停）";
   try{
     const r=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     const j=await r.json();
-    $("cfgMsg").textContent=j.ok?"已应用"+(j.restarted?"（链路已重建）":""):"失败："+(j.error||r.status);
+    $("cfgMsg").textContent=j.ok?"已应用 → "+(j.res||body.res)+(j.restarted?"（链路已重建）":""):"失败："+(j.error||r.status);
     $("cfgMsg").style.color=j.ok?"var(--ok)":"var(--err)";
     if(j.ok&&j.transport!==S.transport){ S.transport=j.transport||body.transport; switchTransport(); }
-    if(j.ok) buildResOptions(j.source==="usb"?{source:"usb"}:{source:"dvp"});   /* 刷新原生/缩放标注 */
+    /* 先刷新状态（拿到新源的 supported_res）再重建下拉，并锚定真正生效的分辨率 */
+    if(j.ok){ await pollStatus(); buildResOptions({source:j.source||body.source,res:j.res||body.res}); }
   }catch(e){ $("cfgMsg").textContent="请求失败："+e; $("cfgMsg").style.color="var(--err)"; }
 }
 function switchTransport(){

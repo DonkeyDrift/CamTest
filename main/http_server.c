@@ -315,7 +315,10 @@ static esp_err_t h_config(httpd_req_t *req)
     if (res && cJSON_IsString(res) && strchr(res->valuestring, 'x')) {
         sscanf(res->valuestring, "%dx%d", &w, &h);
         need_rebuild = src_if_res_supported(w, h);
-        if (!need_rebuild) ok = false;
+        if (!need_rebuild) {
+            ok = false;
+            snprintf(err_msg, sizeof(err_msg), "resolution %s not supported", res->valuestring);
+        }
     }
     if (q && cJSON_IsNumber(q) && q->valueint > 0) { quality = q->valueint; need_rebuild = need_rebuild || quality != src_if_info()->quality; }
     if (fps && cJSON_IsNumber(fps) && fps->valueint > 0) fps_limit = fps->valueint;

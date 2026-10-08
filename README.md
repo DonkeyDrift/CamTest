@@ -261,6 +261,7 @@ OV3660 仅 240×240@24 与 640×480@10（YUYV/RGB565）——矩阵中其余档�
 | 6 | **分辨率切换一次失败后 USB 永久打不开**（get_frame_list 持续 `ESP_ERR_INVALID_ARG`） | teardown 在 close 成功前置 `stream=NULL` → worker 停止态排水捞到 pause 前在途回调的竞态帧时句柄已空 → 帧被丢弃永不归还 → 驱动 "Not all frames are returned" → close 永久失败 → 流对象泄漏占住接口 | 句柄生命周期延长到 close 成功；close 重试（10 轮）每轮前重新 drain，配合 worker 排水把竞态帧归还驱动；修复后 30 次连续切换（320/640/720/176/352 混合 + 源往返）零失败 |
 | 7 | 720p@60 持续码率 ~12Mbps 时 **httpd 被挤死**（POST 超时/连接 reset），TCP 到达仅 24fps | 20MHz Wi-Fi 链路过载 + LWIP TCP 窗口 23KB 卡带宽延迟积 | 大于 640×480 的档位自动限 30fps（fps 传值与驱动**同源浮点计算**，避开 FLOAT_EQUAL 精度坑：整数 60.0f 对 166667→59.99988f 差 2.4e-4 不匹配）；TCP SND/WND 23392→49152 |
 | 8 | 真实 UI 环境（多浏览器 tab 持流 + 500ms 状态轮询）下切换分辨率仍可能触发 #6 的流泄漏 | `stream_start`/`encoder_open` 失败路径原为裸 `uvc_host_stream_close`（无 drain）——start 已 unpause 后失败必踩"帧未归还→close 失败→泄漏"；teardown_req 事件丢失时流悬挂无自愈 | 抽 `safe_close_stream()`（多轮 drain+close）统一所有关闭路径；monitor 检测 `want=0 且流悬挂` 自动补 teardown；帧环 3→5 槽（多客户端各持槽引用时 3 槽会 publish 全失败，实测 out_drops 4661）。加固后 18 次快速连切（2 个限速客户端 + 轮询，含 720p）**零失败零丢帧** |
+| 9 | **UI 切分辨率"看似无效"**：下拉选完应用后立即弹回 1280x720；之后再点"应用配置"或动质量/帧率任意控件，设备被悄悄切到 720p | applyConfig 成功后 `buildResOptions()` 用 `innerHTML` 重建 `<select>` 选项，浏览器把选中项重置回**第一项**（supported_res 首项恰为 1280x720）；且源切换瞬间 S.status.supported_res 还是旧源档位表 | buildResOptions 重建后恢复选中项（当前档不在表内时追加"（当前）"选项兜底）；applyConfig 先 pollStatus 刷新档位表再锚定设备实际生效的 j.res；renderStatus 检测档位表变化自动重建。浏览器实测：USB/DVP 往返 + 176/352/640 连切，下拉保持、横幅一致、原始流真实帧尺寸全部吻合 |
 
 另：显式指定帧率（如 60.0f）在 `uvc_claim_interface` 的描述符匹配中失败过一次（驱动按 `10e6/interval` 的浮点值匹配），故统一传 fps=0 用设备默认帧间隔。
 
