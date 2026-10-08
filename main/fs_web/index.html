@@ -174,8 +174,9 @@ footer{margin-top:16px;color:var(--dim);font-size:12px;border-top:1px solid var(
           <span class="k">① 摄像头内部 <span class="tag est">估算</span></span><span class="v" id="segCam">–</span>
           <span class="k">② ESP32 处理 <span style="color:var(--ok)">精确</span></span><span class="v" id="segEsp">–</span>
           <span class="k">③ 网络+浏览器 <span class="tag est">估算</span></span><span class="v" id="segNet">–</span>
+          <span class="k">时钟同步质量</span><span class="v" id="segSync">–</span>
         </div>
-        <div class="note">USB 源时延拆分：①=摄像头内部曝光/ISP/编码/USB传输（不可直接测，需光学校准标定）；②=帧到达→发布（DVP=编码耗时，USB直通≈拷贝，<code>t_encode−t_capture</code> 精确）；③=端到端−①−②。①未标定时③含①成分。</div>
+        <div class="note">USB 源时延拆分：①=摄像头内部曝光/ISP/编码/USB传输（不可直接测，需光学校准标定）；②=帧到达→发布（DVP=编码耗时，USB直通≈拷贝，<code>t_encode−t_capture</code> 精确）；③=端到端−①−②（①未标定时③含①成分）。③为负=时钟同步偏差（流帧挤占空口所致，窗口收敛后消失），非真实负时延。</div>
       </div>
       <div class="note" id="latNoteDvp">编码耗时 = <code>t_encode − t_capture</code>（设备侧，精确实测）。网络+浏览器传输 = 端到端 − 编码（<span class="tag est">估算</span>，含时钟同步误差，典型 ±5 ms 以内，见 README 误差分析）。</div>
     </div>
@@ -303,7 +304,7 @@ async function syncClock(){
     const t0=Math.round((performance.timeOrigin+performance.now())*1000);
     try{
       const r=await fetch("/api/sync?t_client="+t0,{cache:"no-store"});
-      const t1=Math.round((performance.timeOrigin+performance.now())*1000);
+      const t1=Math.round((performance.timeOrigin+performance.now())*1000);   /* 头到即测：json 解析时间不进 rtt */
       const j=await r.json();
       if(j.t_dev_us!=null){
         const rtt=t1-t0;
@@ -311,15 +312,31 @@ async function syncClock(){
         if(j.t_wall_ms) S.wallDiffMs=j.t_wall_ms-(t1/1000);
       }
     }catch(e){}
-    await new Promise(r=>setTimeout(r,60));
+    await new Promise(r=>setTimeout(r,50+Math.random()*40));   /* 随机相位：覆盖流帧突发周期 */
   }
   if(!probes.length) return;
-  probes.sort((a,b)=>a.rtt-b.rtt);
-  const best=probes.slice(0,3).map(p=>p.off).sort((a,b)=>a-b);
-  S.offsetUs=best[Math.floor(best.length/2)];
-  S.rttUs=probes[0].rtt; S.syncCount++;
+  /* ★ 60fps 下流帧持续挤占空口：sync 响应常被流帧排队延迟 D，off = O+(A−B−p)/2 被
+   *   拉低 D/2（响应侧排队≫请求侧），offset 系统性偏低 → e2e 大量负值（60fps 实测复现）。
+   *   真实 offset ≈ 滚动窗口内 off 的高分位（自下而上逼近，等价 NTP huff-n-puff 思路），
+   *   取 P85 抗离群；窗口 120s 让重同步平滑无跳变；样本不足时退回旧"最小 RTT 前 3 中位" */
+  const now=performance.timeOrigin+performance.now();
+  S.syncHist=S.syncHist||[];
+  probes.forEach(p=>S.syncHist.push({t:now,...p}));
+  while(S.syncHist.length&&S.syncHist[0].t<now-120e3) S.syncHist.shift();
+  let off;
+  if(S.syncHist.length>=12){
+    const offs=S.syncHist.map(p=>p.off).sort((a,b)=>a-b);
+    off=offs[Math.min(offs.length-1,Math.floor(offs.length*0.85))];
+  }else{
+    probes.sort((a,b)=>a.rtt-b.rtt);
+    const best=probes.slice(0,3).map(p=>p.off).sort((a,b)=>a-b);
+    off=best[Math.floor(best.length/2)];
+  }
+  S.offsetUs=off;
+  S.rttUs=Math.min(...S.syncHist.map(p=>p.rtt));
+  S.syncCount++;
   const b=$("bClock");
-  b.innerHTML=`clock <b>offset ${fmtN(S.offsetUs/1000,1)}ms · rtt ${fmtN(S.rttUs/1000,1)}ms · #${S.syncCount}</b>`;
+  b.innerHTML=`clock <b>offset ${fmtN(S.offsetUs/1000,1)}ms · rtt ${fmtN(S.rttUs/1000,1)}ms · #${S.syncCount}（窗口${S.syncHist.length}）</b>`;
   b.className="badge "+(S.rttUs<50000?"ok":S.rttUs<150000?"warn":"err");
 }
 function devUsToClientUs(tDevUs){ return tDevUs - S.offsetUs; } // 设备钟 → 客户端钟
@@ -554,6 +571,13 @@ async function pollStatus(){
   try{
     const r=await fetch("/api/status",{cache:"no-store"});
     S.status=await r.json();
+    /* 设备重启检测：esp_timer 归零 → 旧时钟窗口全部作废（否则 120s 内 e2e 巨幅负值） */
+    const up=S.status&&S.status.device?S.status.device.uptime_s:null;
+    if(up!=null&&S.lastUp!=null&&up<S.lastUp){
+      S.syncHist=[]; S.offsetUs=null; S.frames.length=0; S.syncCount=0;
+      syncClock();
+    }
+    if(up!=null) S.lastUp=up;
     renderStatus();
   }catch(e){ banner("无法获取设备状态（/api/status）："+e); }
 }
@@ -658,7 +682,15 @@ function renderLatSeg(dev){
   const inh=(S.usb&&S.usb.inherent_ms!=null&&S.usb.inherent_ms>=0)?S.usb.inherent_ms:null;
   $("segCam").textContent=inh!=null?fmtN(inh,1)+" ms（标定）":"未标定";
   $("segEsp").textContent=esp!=null?fmtN(esp,1)+" ms":"–";
-  $("segNet").textContent=(e2e!=null&&esp!=null)?fmtN(Math.max(0,e2e-esp),1)+" ms"+(inh==null?"（含①）":""):"–";
+  /* ③ = 端到端 − ① − ②（①标定后必须扣减；负值=时钟同步偏差，红显并注明，不静默截断）
+   * 时延物理上不可能为负：e2e 由时钟同步法测得，offset 误差直接进入 e2e */
+  const seg3=(e2e!=null&&esp!=null)?(e2e-esp-(inh!=null?inh:0)):null;
+  $("segNet").textContent=seg3!=null?fmtN(seg3,1)+" ms"+(inh==null?"（含①）":""):"–";
+  $("segNet").style.color=(seg3!=null&&seg3<0)?"var(--err)":"";
+  const neg=w1.filter(f=>f.lat<0).length;
+  const sy=$("segSync");
+  sy.textContent=w1.length?(neg?("负值帧 "+neg+"/"+w1.length+"（同步偏差，等窗口收敛）"):"正常（0 负值帧）"):"–";
+  sy.style.color=neg?"var(--err)":"var(--ok)";
 }
 /* DVP vs USB 对比表：相同分辨率+协议并排 */
 function renderCompare(rows){
@@ -789,6 +821,8 @@ async function init(){
   $("qDir").textContent=d.quality_desc||"0~100，越大画质越高、码率越大";
   streamLoop();
   setInterval(()=>syncClock(),30000);
+  /* 首次同步失败（撞上链路重建/设备重启）别干等 30s：未拿到 offset 前 5s 快速重试 */
+  setInterval(()=>{ if(S.offsetUs==null||!(S.syncHist||[]).length) syncClock(); },5000);
   setInterval(pollStatus,500);
   setInterval(()=>{bucketSecond();renderLocal();},1000);
   setInterval(reportIfScanning,1000);
