@@ -113,8 +113,13 @@ def scan_loop(sock, ip, args):
                 win_lat = []
                 if total_frames:
                     try:
-                        rq.post(f"http://{ip}:{args.http_port}/api/scan/report",
-                                json=body, timeout=2)
+                        # 仅当前扫描行是 udp 才回传：设备订阅后常驻推 UDP，若不分时机
+                        # 会在 http/ws 行每秒覆写 report 槽，污染浏览器侧时延统计
+                        st = rq.get(f"http://{ip}:{args.http_port}/api/status",
+                                    timeout=1).json()
+                        if ((st.get("scan") or {}).get("cur_protocol")) == "udp":
+                            rq.post(f"http://{ip}:{args.http_port}/api/scan/report",
+                                    json=body, timeout=2)
                     except Exception:
                         pass
                 win_done, win_lost = 0, 0
@@ -144,17 +149,19 @@ def main():
     except OSError:
         pass
 
+    global offset   # scan_loop 读模块级 offset 算时延（原实现只在 main 里赋值 → NameError）
     offset = sync_clock(ip, args.http_port)
     print(f"clock offset = {offset/1000:.2f} ms", file=sys.stderr)
-
-    if args.scan:
-        scan_loop(sock, ip, args)
-        return
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     sock.bind(("", args.local_port))
     sock.settimeout(1.0)
+
+    if args.scan:
+        scan_loop(sock, ip, args)
+        return
+
     sock.sendto(b"SUBSCRIBE\n", (ip, args.udp_port))
     print(f"SUBSCRIBE -> {ip}:{args.udp_port}，接收于 :{args.local_port}", file=sys.stderr)
 

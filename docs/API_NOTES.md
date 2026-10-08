@@ -59,7 +59,8 @@
 - `bsp_camera_start(NULL)` = `bsp_i2c_init()` + LEDC XCLK(20MHz, TIMER1, CH=CONFIG_BSP_CAMERA_XCLK_LEDC_CH 默认 2) + `esp_video_init(dvp_cfg)`。
 - 摄像头电源为板上固定 LDO，代码无电源 GPIO；I2C 与 ES8389 共总线（本任务不初始化音频，无争抢）。
 - 引脚：XCLK=55 PCLK=54 VSYNC=56 HSYNC(DE)=57 D0..D7=46..53；I2C SCL=1 SDA=0。
-- LCD 子板为 RGB 并口 + GT1151（BSP_CAPS_DISPLAY），本任务未接子板，LCD 叠加留 Kconfig 开关 TODO。
+- LCD 子板为 RGB 并口 + GT1158 触摸（BSP_CAPS_DISPLAY + I2C 0x14，驱动 tag `gt1151`）。
+  已实现 `lcd_ui`（`CONFIG_CAMTEST_ENABLE_LCD`，esp_lvgl_port；未接子板探测失败仅告警），见 README §五点五。
 
 ## 7. 其他
 

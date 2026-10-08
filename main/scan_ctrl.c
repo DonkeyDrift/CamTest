@@ -13,6 +13,7 @@
 #include "source_if.h"
 #include "metrics.h"
 #include "wifi_net.h"
+#include "lcd_ui.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "scan";
@@ -438,22 +439,24 @@ int scan_ctrl_csv(char *buf, size_t buflen)
         if (r->unsupported) {
             /* 不支持行：标识列 + tcp/lcd/tsm 常量列，数值列全部留空（16..34 列） */
             int used = snprintf(line, sizeof(line),
-                     "%s,%s,%s,%s,%s,,%s,%s,%s,1,0,%s,,,%s",
+                     "%s,%s,%s,%s,%s,,%s,%s,%s,1,%d,%s,,,%s",
                      r->timestamp, r->video_source, r->sensor, r->usb_device_name,
                      r->resolution, r->quality, r->usb_mode, r->protocol,
+                     lcd_ui_active() ? 1 : 0,
                      r->wifi_mode, r->capture_ts_meaning);
             for (int c = 16; c <= 34; c++) line[used++] = ',';   /* 列 16..34 空 */
             line[used++] = '\n';
             line[used] = 0;
         } else {
             snprintf(line, sizeof(line),
-                     "%s,%s,%s,%s,%s,%d,%s,%s,%s,1,0,%s,%d,%d,%s,"
+                     "%s,%s,%s,%s,%s,%d,%s,%s,%s,1,%d,%s,%d,%d,%s,"
                      "%.2f,%.2f,%.2f,%u,%.3f,"
                      "%.2f,%.2f,%.2f,%.2f,%.2f,"
                      "%s,%u,"
                      "%.1f,%.1f,%u,%u,%u,%s,%s\n",
                      r->timestamp, r->video_source, r->sensor, r->usb_device_name,
                      r->resolution, r->scaled, r->quality, r->usb_mode, r->protocol,
+                     lcd_ui_active() ? 1 : 0,
                      r->wifi_mode, r->bandwidth_mhz, r->rssi, r->capture_ts_meaning,
                      r->capture_fps, r->encode_fps, r->arrival_fps,
                      (unsigned)r->jpeg_avg_bytes, r->bitrate_mbps,

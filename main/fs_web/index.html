@@ -676,8 +676,14 @@ function renderUsb(usb,dev){
   const st=names[usb.state]||usb.state||"–";
   $("uState").textContent=st+" · "+(usb.device||"–")+(dev&&dev.source==="usb"?` · ${dev.usb_mode||""}`:"");
   $("uDisc").textContent=(usb.disconnects!=null?usb.disconnects:"–")+" 次";
-  if(usb.inherent_ms!=null&&usb.inherent_ms>=0){ $("uInh").textContent=fmtN(usb.inherent_ms,1)+" ms"; $("cInh").value=usb.inherent_ms; }
+  if(usb.inherent_ms!=null&&usb.inherent_ms>=0){ $("uInh").textContent=fmtN(usb.inherent_ms,1)+" ms"; }
   else $("uInh").textContent="未标定";
+  /* ★ 与 cSrc/cRes 同款 editing 门闩：500ms 轮询不得回写正在编辑的输入框，
+     否则一填新值就被设备旧值顶回（标定值"改不了"的根因）。
+     聚焦态同样保护：编程式 fill 只聚焦不派发 focus 事件，光靠 editing 标记会漏 */
+  const ci=$("cInh");
+  if(!ci.dataset.editing && document.activeElement!==ci)
+    ci.value=(usb.inherent_ms!=null&&usb.inherent_ms>=0)?usb.inherent_ms:"";
   const tb=$("tTiers").querySelector("tbody");
   const tiers=(usb.tiers||[]);
   tb.innerHTML=tiers.length?tiers.map(t=>`<tr><td>${t.fmt}</td><td>${t.w}x${t.h}</td><td>${(t.fps||[]).join("/")||"-"}</td><td style="color:var(--ok)">原生</td></tr>`).join("")
@@ -842,6 +848,15 @@ async function init(){
   setInterval(reportIfScanning,1000);
   $("bApply").onclick=applyConfig;
   $("cInh").onfocus=e=>e.target.dataset.editing=1;
+  /* input=用户已改动的可靠信号（真实键入与编程式 fill 都派发，fill 不派发 focus 事件） */
+  $("cInh").oninput=e=>e.target.dataset.editing=1;
+  /* 失焦且与设备一致才恢复跟随；改了没写 → 保留草稿——若失焦即清 editing，
+     点“写入”的 mousedown→blur 与下一次 500ms 轮询之间输入可能被顶回旧值 */
+  $("cInh").onblur=e=>{
+    const d=(S.usb&&S.usb.inherent_ms!=null&&S.usb.inherent_ms>=0)?S.usb.inherent_ms:null;
+    const v=parseFloat(e.target.value);
+    if(d===null?isNaN(v):v===d) delete e.target.dataset.editing;
+  };
   $("bInh").onclick=async()=>{
     const v=parseFloat($("cInh").value);
     if(isNaN(v)) return;
@@ -895,6 +910,7 @@ async function init(){
     if(m==null||m<0||m>1000){ $("calOut").innerHTML="<span style='color:var(--err)'>均值超出合理范围（5~500ms），请弃用离群样本后重试</span>"; return; }
     try{
       await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({usb_inherent_ms:Math.round(m*10)/10})});
+      delete $("cInh").dataset.editing;   /* 向导写入后释放输入框，跟随新值 */
       $("cfgMsg").textContent="已写入标定值 ①="+fmtN(m,1)+" ms（三段拆分闭合：③=端到端−①−②）";
       $("cfgMsg").style.color="var(--ok)";
       pollStatus();

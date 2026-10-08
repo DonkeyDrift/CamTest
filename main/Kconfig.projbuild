@@ -101,4 +101,23 @@ menu "CamTest Configuration"
         int "扫描每组采样时长 ms"
         default 10000
 
+    config CAMTEST_ENABLE_LCD
+        bool "启用 LCD 预览与触屏调参（4.3\" 800x480 RGB + GT1151）"
+        default y
+        help
+            上电时先探测 GT1151（I2C 0x14）：未接 LCD 子板则跳过初始化，
+            不影响主流程（仅日志告警）。
+            接了子板后：右侧参数面板触屏操作与 POST /api/config 完全同
+            一条路径（apply 成功才落盘），左侧为实时预览。
+
+    config CAMTEST_LCD_PREVIEW_FPS
+        int "LCD 预览解码帧率上限"
+        depends on CAMTEST_ENABLE_LCD
+        range 0 30
+        default 10
+        help
+            预览解码与 JPEG 编码共用硬件编解码单例（互斥信号量），预览
+            解码安排在编码空闲窗口、任务优先级低于采集/编码，但仍占用
+            少量编码时间；0 = 不创建解码引擎，编码通路零影响。
+
 endmenu

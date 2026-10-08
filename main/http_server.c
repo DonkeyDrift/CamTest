@@ -29,20 +29,31 @@
 #include "camera_pipeline.h"
 #include "source_if.h"
 #include "metrics.h"
+#include "app_config.h"
 #include "scan_ctrl.h"
 #include "stream_server.h"
 #include "wifi_net.h"
 #include "web_ui.h"
+#include "lcd_ui.h"
 #include "sdkconfig.h"
+#include "esp_system.h"
 
 static const char *TAG = "http_api";
 static httpd_handle_t s_server;
+
+/* /api/scan/report 收发计数（status.scan.rep_* 暴露：区分「页面没发」vs「服务端没收」） */
+static uint32_t s_rep_ok, s_rep_bad;
+
+/* status 缓冲：rows JSON ≈741B × 128 行 + 基础块 ≈ 105KB。原 32768 时 rows 循环
+ * 溢出，used 越过 cap 后末尾 snprintf(cap−used) size_t 下溢 → 越界写 → 堆损坏重启
+ *（2026-10-09 扫描中实测；响应还越界发送出 0x8c 垃圾字节） */
+#define STATUS_CAP 163840
 
 /* PSRAM 大缓冲（httpd 单任务访问，无竞争；懒分配） */
 static char *status_buf(void)
 {
     static char *buf;
-    if (!buf) buf = heap_caps_malloc(32768, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = heap_caps_malloc(STATUS_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     return buf;
 }
 
@@ -109,8 +120,18 @@ static esp_err_t h_status(httpd_req_t *req)
 {
     char *out = status_buf();
     if (!out) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no mem");
-    const size_t cap = 32768;
+    const size_t cap = STATUS_CAP;
     size_t used = 0;
+    /* 追加式 snprintf：返回值是未截断长度，used 一旦 > cap，下一次 cap−used 即
+     * size_t 下溢 → 越界写。统一夹取：used 恒 ≤ cap（满则丢 JSON 尾巴，页面表现
+     * 为 stale，绝不越界写/越界读）。 */
+#define SAPP(...) do { \
+        if (used < cap) { \
+            int _n = snprintf(out + used, cap - used, __VA_ARGS__); \
+            if (_n > 0) used += (size_t)_n; \
+            if (used > cap) used = cap; \
+        } \
+    } while (0)
 
     src_info_t *ci = src_if_info();
     metrics_t *m = metrics_get();
@@ -120,15 +141,17 @@ static esp_err_t h_status(httpd_req_t *req)
 
     char clients[512] = "";
     int coff = 0;
-    for (int i = 0; i < ncli; i++) {
+    /* 单条 ~75B × 8 客户端 ≈ 600B > 512：不夹取会复现同样的 size_t 下溢越界写 */
+    for (int i = 0; i < ncli && coff < (int)sizeof(clients) - 120; i++) {
         coff += snprintf(clients + coff, sizeof(clients) - coff,
                          "%s{\"type\":\"%s\",\"ip\":\"%s\",\"fps\":%.1f,\"mbps\":%.2f}",
                          coff ? "," : "", cli[i].type, cli[i].ip, cli[i].fps, cli[i].mbps);
     }
     char res_list[160] = "";
     src_if_supported_res(res_list, sizeof(res_list));
+    lcd_ui_stats_t lcd = lcd_ui_stats();
 
-    used += snprintf(out + used, cap - used,
+    SAPP(
         "{\"device\":{"
         "\"source\":\"%s\",\"usb_mode\":\"%s\","
         "\"sensor\":\"%s\",\"usb_device\":\"%s\","
@@ -142,9 +165,9 @@ static esp_err_t h_status(httpd_req_t *req)
         "\"free_heap\":%u,\"min_heap\":%u,\"free_psram\":%u,\"min_psram\":%u,"
         "\"drop_capture\":%u,\"drop_encode\":%u,"
         "\"stack\":[%d,%d],"
-        "\"uptime_s\":%u,"
+        "\"uptime_s\":%u,\"rst_reason\":%d,"
         "\"overlay\":%s,\"target_mbps\":%.1f,\"gov_last\":\"%s\",\"hifps\":%d,"
-        "\"tcp_nodelay\":1,\"lcd_on\":0,"
+        "\"tcp_nodelay\":1,\"lcd_on\":%d,\"lcd_prev_fps\":%.1f,\"lcd_dec_ms\":%.1f,"
         "\"wifi\":{\"mode\":\"%s\",\"phy\":\"%s\",\"channel\":%d,\"band_mhz\":%d,\"rssi\":%d,\"ssid\":\"%s\"},"
         "\"ip\":\"%s\",\"mdns\":\"%s.local\","
         "\"clients\":[%s],"
@@ -160,8 +183,9 @@ static esp_err_t h_status(httpd_req_t *req)
         (unsigned)m->free_heap, (unsigned)m->min_heap,
         (unsigned)m->free_psram, (unsigned)m->min_psram,
         (unsigned)m->drop_capture, (unsigned)m->drop_encode,
-        m->stack_cap, m->stack_enc, (unsigned)m->uptime_s,
+        m->stack_cap, m->stack_enc, (unsigned)m->uptime_s, esp_reset_reason(),
         src_if_overlay() ? "true" : "false", m->target_mbps, m->gov_last, cam_boost_level(),
+        lcd.active ? 1 : 0, lcd.preview_fps, lcd.dec_ms,
         w->mode == WIFI_MODE_STA_M ? "STA" : "AP", w->phy, w->channel, w->band_mhz,
         w->rssi, w->ssid, w->ip, CONFIG_CAMTEST_MDNS_HOSTNAME, clients,
         esp_get_idf_version());
@@ -172,7 +196,7 @@ static esp_err_t h_status(httpd_req_t *req)
         int nt = src_if_usb_get_tiers(tiers, USB_TIER_MAX);
         bool mjpeg = false, yuy2 = false;
         for (int i = 0; i < nt; i++) { if (tiers[i].mjpeg) mjpeg = true; else yuy2 = true; }
-        used += snprintf(out + used, cap - used,
+        SAPP(
             "\"usb\":{\"state\":\"%s\",\"device\":\"%s\",\"disconnects\":%u,"
             "\"mjpeg\":%s,\"yuy2\":%s,\"inherent_ms\":%.1f,\"tiers\":[",
             src_if_usb_state() == USB_STATE_DISABLED ? "disabled" :
@@ -183,15 +207,15 @@ static esp_err_t h_status(httpd_req_t *req)
             mjpeg ? "true" : "false", yuy2 ? "true" : "false",
             src_if_usb_inherent_ms());
         for (int i = 0; i < nt && used < cap - 600; i++) {
-            used += snprintf(out + used, cap - used,
+            SAPP(
                              "%s{\"fmt\":\"%s\",\"w\":%u,\"h\":%u,\"fps\":[",
                              i ? "," : "", tiers[i].fmt, tiers[i].w, tiers[i].h);
             for (int f = 0; f < tiers[i].fps_n; f++) {
-                used += snprintf(out + used, cap - used, "%s%d", f ? "," : "", tiers[i].fps[f]);
+                SAPP( "%s%d", f ? "," : "", tiers[i].fps[f]);
             }
-            used += snprintf(out + used, cap - used, "]}");
+            SAPP( "]}");
         }
-        used += snprintf(out + used, cap - used, "]},\"supported_res\":[");
+        SAPP( "]},\"supported_res\":[");
     }
 
     char tmp[160];    strlcpy(tmp, res_list, sizeof(tmp));
@@ -199,11 +223,11 @@ static esp_err_t h_status(httpd_req_t *req)
     bool first = true;
     tok = strtok_r(tmp, ",", &save);
     while (tok && used < cap - 4000) {
-        used += snprintf(out + used, cap - used, "%s\"%s\"", first ? "" : ",", tok);
+        SAPP( "%s\"%s\"", first ? "" : ",", tok);
         first = false;
         tok = strtok_r(NULL, ",", &save);
     }
-    used += snprintf(out + used, cap - used, "],");
+    SAPP( "],");
 
     /* 扫描（两级进度：当前源/当前组） */
     static scan_row_t *rows;   /* PSRAM */
@@ -211,17 +235,18 @@ static esp_err_t h_status(httpd_req_t *req)
     int n = rows ? scan_ctrl_rows(rows, 128) : 0;
     scan_prog_t prog;
     scan_ctrl_progress(&prog);
-    used += snprintf(out + used, cap - used,
+    SAPP(
                      "\"scan\":{\"state\":\"%s\",\"idx\":%d,\"total\":%d,"
                      "\"cur_source\":\"%s\",\"cur_protocol\":\"%s\",\"cur_res\":\"%s\",\"cur_quality\":\"%s\","
-                     "\"usb_skipped\":%s,\"rows\":[",
+                     "\"usb_skipped\":%s,\"rep_ok\":%u,\"rep_bad\":%u,\"rows\":[",
                      prog.state == SCAN_RUNNING ? "running" : prog.state == SCAN_DONE ? "done" : "idle",
                      prog.idx, prog.total, prog.cur_source, prog.cur_protocol,
                      prog.cur_res, prog.cur_quality,
-                     prog.usb_skipped ? "true" : "false");
-    for (int i = 0; i < n && used < cap - 600; i++) {
+                     prog.usb_skipped ? "true" : "false",
+                     (unsigned)s_rep_ok, (unsigned)s_rep_bad);
+    for (int i = 0; i < n && used < cap - 1024; i++) {   /* 单行 ~741B + 尾部 ]}} 需留 1024 */
         scan_row_t *r = &rows[i];
-        used += snprintf(out + used, cap - used,
+        SAPP(
                         "%s{\"timestamp\":\"%s\",\"video_source\":\"%s\",\"sensor\":\"%s\","
                         "\"usb_device_name\":\"%s\",\"resolution\":\"%s\",\"scaled\":%d,"
                         "\"quality\":\"%s\",\"usb_mode\":\"%s\",\"protocol\":\"%s\","
@@ -251,7 +276,8 @@ static esp_err_t h_status(httpd_req_t *req)
                         r->udp_loss_rate, r->udp_incomplete_rate,
                         r->unsupported ? "true" : "false");
     }
-    used += snprintf(out + used, cap - used, "]}}");   /* rows 数组 + scan 对象 + 根对象 */
+    SAPP( "]}}");   /* rows 数组 + scan 对象 + 根对象 */
+#undef SAPP
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -272,108 +298,11 @@ static esp_err_t h_config(httpd_req_t *req)
     cJSON *j = cJSON_Parse(body);
     if (!j) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
 
-    const cJSON *src = cJSON_GetObjectItem(j, "source");
-    const cJSON *res = cJSON_GetObjectItem(j, "res");
-    const cJSON *q = cJSON_GetObjectItem(j, "quality");
-    const cJSON *fps = cJSON_GetObjectItem(j, "fps_limit");
-    const cJSON *ov = cJSON_GetObjectItem(j, "overlay");
-    const cJSON *br = cJSON_GetObjectItem(j, "target_mbps");
-    const cJSON *um = cJSON_GetObjectItem(j, "usb_mode");
-    const cJSON *inh = cJSON_GetObjectItem(j, "usb_inherent_ms");
-    const cJSON *vts = cJSON_GetObjectItem(j, "vts");     /* 兼容：仅 VTS（诊断用） */
-    const cJSON *bst = cJSON_GetObjectItem(j, "boost");   /* OV3660 高帧率窗口裁剪 */
-    const cJSON *hfp = cJSON_GetObjectItem(j, "hifps");   /* 0-4 档位（推荐入口） */
-
-    char err_msg[64] = "";
-    bool ok = true;
-
-    /* 1) 采集源热切换（先于其他参数；失败立即回滚并返回错误） */
-    if (src && cJSON_IsString(src)) {
-        video_source_t want = strcmp(src->valuestring, "usb") == 0 ? VIDEO_SOURCE_USB : VIDEO_SOURCE_DVP;
-        esp_err_t serr = src_if_switch(want);
-        if (serr != ESP_OK) {
-            snprintf(err_msg, sizeof(err_msg), "source switch to %s failed: %s",
-                     src->valuestring, esp_err_to_name(serr));
-            ok = false;
-        }
-    }
-    /* 2) USB 模式切换（passthrough / reencode） */
-    if (ok && um && cJSON_IsString(um)) {
-        usb_mode_t m = strcmp(um->valuestring, "reencode") == 0 ? USB_MODE_REENCODE :
-                       strcmp(um->valuestring, "passthrough") == 0 ? USB_MODE_PASSTHROUGH : USB_MODE_NONE;
-        if (m != USB_MODE_NONE && src_if_usb_set_mode(m) != ESP_OK) {
-            snprintf(err_msg, sizeof(err_msg), "usb mode switch to %s failed", um->valuestring);
-            ok = false;
-        }
-    }
-    /* 3) 摄像头内部固有延迟标定值（U4：只能由光学闭环人工标定，设备绝不自行生成）；
-     *    负值 = 清除标定（回到未标定态） */
-    if (ok && inh && cJSON_IsNumber(inh)) {
-        src_if_usb_set_inherent_ms(inh->valuedouble >= 0 ? (float)inh->valuedouble : -1.0f);
-    }
-
-    if (ov && cJSON_IsBool(ov)) {
-        bool ov_on = cJSON_IsTrue(ov);
-        src_if_set_overlay(ov_on);
-        /* passthrough 不解码、无法烧录毫秒计数器：开启叠加时自动切重编码（set_mode 同步重开并带回滚），
-         * /overlay 校验页只发 {overlay:true}，靠这一步保证 USB 直通下计数器也能真正出现 */
-        if (ov_on && src_if_current() == VIDEO_SOURCE_USB &&
-            src_if_usb_mode() == USB_MODE_PASSTHROUGH) {
-            esp_err_t merr = src_if_usb_set_mode(USB_MODE_REENCODE);
-            if (merr != ESP_OK)
-                ESP_LOGW(TAG, "overlay 需要重编码，但 USB 模式切换失败：%s", esp_err_to_name(merr));
-        }
-    }
-    if (br && cJSON_IsNumber(br)) metrics_set_target_mbps(br->valuedouble);
-
-    bool need_rebuild = false;
-    int w = 0, h = 0;
-    uint8_t quality = 0;
-    int fps_limit = 0;
-    int vts_val = (vts && cJSON_IsNumber(vts)) ? vts->valueint : -1;
-    if (res && cJSON_IsString(res) && strchr(res->valuestring, 'x')) {
-        sscanf(res->valuestring, "%dx%d", &w, &h);
-        need_rebuild = src_if_res_supported(w, h);
-        if (!need_rebuild) {
-            ok = false;
-            snprintf(err_msg, sizeof(err_msg), "resolution %s not supported", res->valuestring);
-        }
-    }
-    if (q && cJSON_IsNumber(q) && q->valueint > 0) { quality = q->valueint; need_rebuild = need_rebuild || quality != src_if_info()->quality; }
-    if (fps && cJSON_IsNumber(fps) && fps->valueint > 0) fps_limit = fps->valueint;
-
-    esp_err_t err = ESP_OK;
-    bool is_dvp = src_if_current() == VIDEO_SOURCE_DVP;
-    if (ok && is_dvp && hfp && cJSON_IsNumber(hfp)) {
-        cam_boost_apply_level(hfp->valueint);
-        if (!w) { w = 160; h = 120; }   /* 高帧率档默认目标 160x120 */
-        need_rebuild = true;
-    }
-    if (!ok) {
-        /* 源/模式切换失败：不再动参数 */
-    } else if (is_dvp && bst && cJSON_IsObject(bst)) {
-        cam_boost_params_t bp = {0};
-        const cJSON *f;
-        if ((f = cJSON_GetObjectItem(bst, "vts")) && cJSON_IsNumber(f)) bp.vts = f->valueint;
-        if ((f = cJSON_GetObjectItem(bst, "hts")) && cJSON_IsNumber(f)) bp.hts = f->valueint;
-        if ((f = cJSON_GetObjectItem(bst, "vstart")) && cJSON_IsNumber(f)) bp.vstart = f->valueint;
-        if ((f = cJSON_GetObjectItem(bst, "vend")) && cJSON_IsNumber(f)) bp.vend = f->valueint;
-        if ((f = cJSON_GetObjectItem(bst, "hstart")) && cJSON_IsNumber(f)) bp.hstart = f->valueint;
-        if ((f = cJSON_GetObjectItem(bst, "hend")) && cJSON_IsNumber(f)) bp.hend = f->valueint;
-        if ((f = cJSON_GetObjectItem(bst, "c303b")) && cJSON_IsNumber(f)) cam_boost_clk_set(f->valueint, -1, -1);
-        if ((f = cJSON_GetObjectItem(bst, "c303d")) && cJSON_IsNumber(f)) cam_boost_clk_set(-1, f->valueint, -1);
-        if ((f = cJSON_GetObjectItem(bst, "c3824")) && cJSON_IsNumber(f)) cam_boost_clk_set(-1, -1, f->valueint);
-        if (!w) { w = 240; h = 240; }   /* boost 基于母本档，未指定 res 时默认 240x240 */
-        err = cam_pipe_apply_boost(w, h, quality, fps_limit, bp.vts ? &bp : NULL);
-    } else if ((need_rebuild || vts_val >= 0) && is_dvp) {
-        err = src_if_apply(w, h, quality, fps_limit);
-    } else if (need_rebuild) {
-        err = src_if_apply(w, h, quality, fps_limit);   /* USB 源：重协商流 */
-    } else if (fps_limit) {
-        src_if_set_fps_limit(fps_limit);   /* 轻量：不重建 */
-    } else if (quality) {
-        err = src_if_set_quality(quality); /* 轻量：只改质量 */
-    }
+    /* 配置应用的完整逻辑在 app_config.c（与启动恢复共用同一实现）；
+     * 仅全部成功才合并落盘 —— 部分更新语义：只覆盖本次 POST 出现的字段 */
+    app_cfg_result_t r;
+    app_config_apply(j, &r);
+    if (r.ok) app_config_persist(j);
     cJSON_Delete(j);
 
     src_info_t *ci = src_if_info();
@@ -381,12 +310,9 @@ static esp_err_t h_config(httpd_req_t *req)
     snprintf(reply, sizeof(reply),
              "{\"ok\":%s,\"restarted\":%s,\"source\":\"%s\",\"usb_mode\":\"%s\","
              "\"res\":\"%ux%u\",\"quality\":%u,\"error\":\"%s\"}",
-             ok && err == ESP_OK ? "true" : "false", need_rebuild ? "true" : "false",
+             r.ok ? "true" : "false", r.restarted ? "true" : "false",
              src_if_source_name(ci->source), src_if_usb_mode_name(ci->usb_mode),
-             ci->w, ci->h, ci->quality,
-             err_msg[0] ? err_msg :
-             err == ESP_ERR_NOT_SUPPORTED ? "resolution not supported by current source" :
-             err != ESP_OK ? esp_err_to_name(err) : "");
+             ci->w, ci->h, ci->quality, r.error);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, reply, HTTPD_RESP_USE_STRLEN);
 }
@@ -428,10 +354,12 @@ static esp_err_t h_scan_result(httpd_req_t *req)
 
 static esp_err_t h_scan_csv(httpd_req_t *req)
 {
-    static char *csv;   /* 51+ 行 × ~400B，静态缓冲改 PSRAM */
-    if (!csv) csv = heap_caps_malloc(32768, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    static char *csv;   /* 128 行 × 行缓冲 640B ≈ 82KB 上界：32768 会截断，且
+                         * scan_ctrl_csv 返回未截断累加值 → 越界发送 */
+    if (!csv) csv = heap_caps_malloc(98304, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!csv) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no mem");
-    int n = scan_ctrl_csv(csv, 32768 - 1);
+    int n = scan_ctrl_csv(csv, 98304 - 1);
+    if (n < 0 || n > 98303) n = 98303;
     httpd_resp_set_type(req, "text/csv; charset=utf-8");
     httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=camtest_scan.csv");
     return httpd_resp_send(req, csv, n);
@@ -447,8 +375,10 @@ static esp_err_t h_scan_report(httpd_req_t *req)
 {
     char body[512] = {0};
     int len = req->content_len;
-    if (len <= 0 || len >= (int)sizeof(body))
+    if (len <= 0 || len >= (int)sizeof(body)) {
+        s_rep_bad++;
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad length");
+    }
     httpd_req_recv(req, body, len);
     cJSON *j = cJSON_Parse(body);
     if (j) {
@@ -462,6 +392,9 @@ static esp_err_t h_scan_report(httpd_req_t *req)
             scan_ctrl_report_udp(jnum(j, "udp_loss_rate"), jnum(j, "udp_incomplete_rate"));
         }
         cJSON_Delete(j);
+        s_rep_ok++;
+    } else {
+        s_rep_bad++;
     }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);

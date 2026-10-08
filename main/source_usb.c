@@ -37,6 +37,7 @@
 #include "esp_timer.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"     /* esp_restart：帧停滞看门狗的重启兜底 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -48,6 +49,7 @@
 #include "esp_video_ioctl.h"    /* VIDIOC_S_DQBUF_TIMEOUT（esp_video 自定义 ioctl） */
 #include "driver/jpeg_decode.h" /* S31 硬件 JPEG 解码：MJPEG 档重编码路径（YUY2 档只有 10fps） */
 #include "camera_pipeline.h"     /* cam_pipe_ring()：共享帧环；编码器设备号约定 */
+#include "scan_ctrl.h"           /* scan_ctrl_state()：扫描期间抑制 esp_restart（毁整轮矩阵） */
 #include "yuv_osd.h"
 #include "sdkconfig.h"
 
@@ -57,12 +59,28 @@ static const char *TAG = "src_usb";
 
 #define USB_DEV_ANY          0
 #define FRAME_BUFFERS        4      /* uvc 驱动帧缓冲数（按协商 dwMaxVideoFrameSize 自分配 PSRAM；4 个平滑 60fps 突发） */
-#define NUM_URBS             8      /* ISOC 在途 URB 数：4×10KB 仅 1.5ms 微帧覆盖，抖动即丢包（FID 错→整帧弃）；
-                                         * 8×10KB=3ms（URB 为内部 DMA RAM，8 个约 80KB 可承受） */
-#define URB_SIZE             (10 * 1024)
+#define NUM_URBS             8      /* ISOC 在途 URB 数：数量掉到 4 时仅 1.5ms 微帧覆盖即丢包
+                                         * （FID 错→整帧弃）。在途覆盖 =（URB数−1）×每URB微帧数×125µs */
+#define URB_SIZE             9216   /* 3×3072B MPS 微帧：覆盖（8−1）×3×125µs=2.625ms，高于 1.5ms
+                                         * 失败点 75%；且 8×9216=72KB 比 8×12288=96KB 省 24.6KB
+                                         * 内部 DMA——LCD 面板链表/任务栈与 UVC 在途缓冲共存的预算关键 */
 #define WORK_QUEUE_LEN       4      /* 与 FRAME_BUFFERS 对齐（深于驱动缓冲数无意义） */
 #define STREAM_OPEN_TIMEOUT_MS 5000
 #define RETRY_BACKOFF_MS     1000   /* ERROR 态重试间隔（供电不足场景别疯狂重试） */
+/* 帧停滞看门狗：uvc 驱动存在静默停流路径（isoc 包 CANCELED/NO_DEVICE →
+ * uvc_host_stream_pause 直接置 streaming=false：不回调任何事件、不打日志、不再
+ * resubmit URB），停后流仍报 stream_up=1 而帧永久为零。真机 2026-10-08 实测：
+ * 60fps 稳跑 1230s 后无任何错误日志归零，20+ 分钟不自愈，页面打开只见黑屏。
+ * 监测：stream_up && want_stream 但 cap_frames 停滞 → 强制 teardown 走既有
+ * teardown→reopen 自愈链路；连续 STALL_MAX_ROUNDS 轮重开仍无帧（驱动/总线
+ * 楔死）→ esp_restart 兜底（与 main.c cam_watch 的 DVP 看门狗同语义） */
+#define STALL_TIMEOUT_US     (5 * 1000000)
+#define STALL_MAX_ROUNDS     6
+/* 连续打开失败满 60 s → 重启：want+dev 恒真而 open 永久失败 = 设备/总线楔死
+ * （真机实测：静默停流后 teardown 的 CTRL timeout 使驱动 close 簿记不一致 →
+ * get_frame_list 永久 INVALID_ARG，1 s 重试永不愈），只有重启触发 USB 重枚举
+ * （端口复位）才能自愈——实测复位后同一摄像头立即恢复推流 */
+#define OPEN_FAIL_REBOOT_US  (60 * 1000000)
 #define ENC_IN_BUFS          2
 #define ENC_OUT_BUFS         3
 #define ENC_DQBUF_TIMEOUT_MS 200
@@ -99,6 +117,7 @@ struct usb_priv_s {
     /* uvc 流 */
     volatile uvc_host_stream_hdl_t stream;
     volatile bool stream_up;
+    volatile uint32_t stream_gen;                 /* 成功开流代数（帧停滞看门狗据此给首帧宽限期） */
 
     /* 编码器（仅 reencode；/dev/video10 与 DVP 同一台，两源互斥运行） */
     int enc_fd;
@@ -369,11 +388,22 @@ static void stream_event_cb(const uvc_host_stream_event_data_t *event, void *use
     case UVC_HOST_TRANSFER_ERROR:
         s_u.open_errors++;          /* 传输错误计数（供电不足时显著增长） */
         break;
-    case UVC_HOST_FRAME_BUFFER_OVERFLOW:
-    case UVC_HOST_FRAME_BUFFER_UNDERFLOW:
-        s_u.overflow_events++;
-        s_u.stats.cap_drops++;
-        break;
+	case UVC_HOST_FRAME_BUFFER_OVERFLOW:
+	case UVC_HOST_FRAME_BUFFER_UNDERFLOW:
+		s_u.overflow_events++;
+		s_u.stats.cap_drops++;
+		break;
+	case UVC_HOST_DEVICE_SUSPENDED:
+		/* 驱动收到挂起已静默 pause（帧停、零日志）——若落进 default 忽略，
+		 * stream_up 会卡 1 成死态；置 teardown 让 monitor 关流，RESUMED 后
+		 * 按 want_stream 自动重开 */
+		ESP_LOGW(TAG, "UVC 流事件：设备挂起（suspend），停流待 monitor 重开");
+		s_u.stream_up = false;
+		s_u.teardown_req = true;
+		break;
+	case UVC_HOST_DEVICE_RESUMED:
+		ESP_LOGW(TAG, "UVC 流事件：设备恢复（resume），monitor 将按 want 自动重开");
+		break;
     default:
         break;
     }
@@ -783,6 +813,7 @@ static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
     s_u.next_due_us = 0;
     rebuild_tiers();   /* ★ 必须先于 stream_up=true：switch 返回后上层立即查档位表 */
     s_u.stream_up = true;
+    s_u.stream_gen++;  /* 看门狗基线换代：给新流 5s 首帧宽限（旧流的停滞计时不带入） */
     /* ★ 开流收尾必须【归还】open 期间（stream_start 起即有帧流入，encoder_open/档位
      * 日志可达数百 ms）排队的帧，绝不能 xQueueReset 静默丢弃——丢弃=帧永不归还=
      * 下次 close 永久失败=流泄漏接口占死（真机楔死根因之一） */
@@ -974,13 +1005,65 @@ static void usb_lib_task(void *arg)
 /* ---------- monitor：client 事件派发 + 状态机 + 自动重连（U5） ---------- */
 static void monitor_task(void *arg)
 {
+    static int64_t open_fail_since;   /* 连续打开失败起始（0=未在失败中；dev 拔出/开流成功即清零） */
     for (;;) {
         usb_host_client_handle_events(s_u.client, 0);   /* 非阻塞派发 NEW_DEV/DEV_GONE */
         static uint64_t last_hb;
         if (esp_timer_get_time() - last_hb > 5000000) {
-            ESP_LOGI(TAG, "monitor 心跳：dev=%d stream=%d want=%d",
-                     (int)s_u.dev_present, (int)s_u.stream_up, (int)s_u.want_stream);
+            ESP_LOGI(TAG, "monitor 心跳：dev=%d stream=%d want=%d cap=%u",
+                     (int)s_u.dev_present, (int)s_u.stream_up, (int)s_u.want_stream,
+                     (unsigned)s_u.stats.cap_frames);
             last_hb = esp_timer_get_time();
+        }
+
+        /* ★ 帧停滞看门狗（背景与阈值见 STALL_* 定义处注释）：驱动静默停流时
+         * stream_up/want 恒为 1 而帧归零，旧状态机依赖 !stream_up 才重连，
+         * 卡 1 即永不自愈——这里补上唯一缺失的触发条件 */
+        {
+            static uint32_t last_gen, last_frames;
+            static int64_t  last_progress_us;
+            static uint8_t  stall_rounds;
+            uint32_t gen = s_u.stream_gen;
+            if (gen != last_gen) {
+                /* 新流刚开好：重置首帧宽限基线（停滞轮数只在帧真正流动后清零） */
+                last_gen = gen;
+                last_frames = s_u.stats.cap_frames;
+                last_progress_us = esp_timer_get_time();
+            } else if (s_u.stream_up && s_u.want_stream) {
+                uint32_t frames = s_u.stats.cap_frames;
+                int64_t now = esp_timer_get_time();
+                if (frames != last_frames) {
+                    last_frames = frames;
+                    last_progress_us = now;
+                    stall_rounds = 0;
+                } else if (now - last_progress_us > STALL_TIMEOUT_US) {
+                    stall_rounds++;
+                    ESP_LOGE(TAG, "帧停滞看门狗：%lld s 无新帧 → teardown 重开（第 %u/%u 轮；"
+                             "held=%d nohandle=%u open_err=%u disc=%u ovr=%u）",
+                             (long long)((now - last_progress_us) / 1000000),
+                             (unsigned)stall_rounds, (unsigned)STALL_MAX_ROUNDS,
+                             s_u.frames_held, (unsigned)s_u.cb_nohandle,
+                             (unsigned)s_u.open_errors, (unsigned)s_u.disconnects,
+                             (unsigned)s_u.overflow_events);
+                    last_progress_us = now;   /* 重开期间防重复触发（teardown 下轮即执行） */
+                    if (stall_rounds >= STALL_MAX_ROUNDS) {
+                        if (scan_ctrl_state() == SCAN_RUNNING) {
+                            /* 扫描中重启会毁掉整轮矩阵（2026-10-09 真机：重编码档
+                             * 楔死触发重启，72 行扫到 18 行即被清零）——改为继续
+                             * teardown 重开轮询，每行 apply 的切流也会重建会话；
+                             * 扫描结束后若仍楔死，下一轮计数自然触发重启 */
+                            ESP_LOGW(TAG, "连续 %u 轮重开仍无帧，但扫描进行中，"
+                                     "推迟重启并继续重开自愈", (unsigned)stall_rounds);
+                            stall_rounds = 0;
+                        } else {
+                            ESP_LOGE(TAG, "连续 %u 轮重开仍无帧（驱动/总线楔死），重启系统兜底",
+                                     (unsigned)stall_rounds);
+                            esp_restart();
+                        }
+                    }
+                    s_u.teardown_req = true;
+                }
+            }
         }
 
         /* 清理请求 / 自愈（want=0 但流悬挂）/ close 重试（close 未完成句柄保留中）：
@@ -1007,6 +1090,8 @@ static void monitor_task(void *arg)
 
         /* 自动（重）连接：USB 为当前源 && 有设备 && 未推流 && 无残留流句柄 → 周期尝试
          * （残留句柄=上次 close 未完成，接口仍被占，open 必失败，先等上面补关） */
+        /* 计时窗口=「want+dev 恒真且推流未成」；拔出/切走/已开流都清零，防陈旧计时误重启 */
+        if (!s_u.dev_present || !s_u.want_stream || s_u.stream_up) open_fail_since = 0;
         if (s_u.want_stream && s_u.dev_present && !s_u.stream_up && !s_u.teardown_req && !s_u.stream) {
             int64_t now = esp_timer_get_time();
             if (now >= s_u.next_retry_us) {
@@ -1015,10 +1100,31 @@ static void monitor_task(void *arg)
                 xSemaphoreGive(s_u.lock);
                 if (err != ESP_OK) {
                     s_u.open_errors++;
+                    if (!open_fail_since) open_fail_since = now;
+                    else if (now - open_fail_since > OPEN_FAIL_REBOOT_US) {
+                        if (scan_ctrl_state() == SCAN_RUNNING) {
+                            /* 扫描中重启会毁掉整轮矩阵——推迟 60 s 窗口继续 1 s 重试
+                             * （scan 每行 apply 会 teardown+open，本身也是自愈路径）；
+                             * 扫描结束后窗口重新累计，仍不愈才重启 */
+                            ESP_LOGW(TAG, "连续 %lld s 打开失败，扫描进行中推迟重启，继续重试",
+                                     (long long)((now - open_fail_since) / 1000000));
+                            open_fail_since = now;
+                        } else {
+                            /* 真机实测（2026-10-08）：静默停流→teardown CTRL timeout→驱动
+                             * close 簿记不一致 → open 永久失败，1 s 重试不愈；重启后同一
+                             * 摄像头经 USB 重枚举立即恢复——见 OPEN_FAIL_REBOOT_US 注释 */
+                            ESP_LOGE(TAG, "连续 %lld s 打开失败仍不愈（dev=1 want=1 held=%d），"
+                                     "重启由 USB 重枚举自愈",
+                                     (long long)((now - open_fail_since) / 1000000), s_u.frames_held);
+                            esp_restart();
+                        }
+                    }
                     s_u.next_retry_us = now + RETRY_BACKOFF_MS * 1000;
                     ESP_LOGW(TAG, "UVC 打开失败（%s），%d s 后重试；若反复失败请检查 USB 供电"
                              "（Korvo-1 Type-A 经 TPS2051C 限流 500 mA，须 Type-C 口补供电）",
                              esp_err_to_name(err), RETRY_BACKOFF_MS / 1000);
+                } else {
+                    open_fail_since = 0;
                 }
             }
         }

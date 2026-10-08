@@ -53,6 +53,9 @@ mDNS: http://korvo-s31.local
 pipeline: <sensor> <W>x<H> <fmt> q20 ...
 采集源就绪：DVP（默认）+ USB
 USB Host 就绪，未发现 UVC 设备（热插拔监听中；注意 Korvo-1 Type-A 口限流 500 mA）
+gt1151: IC version: GT1158_...        （CONFIG_CAMTEST_ENABLE_LCD=y 且接了 LCD 子板时）
+lcd_ui: LCD UI 已启动 800x480，预览 on（限速 10 fps）
+LVGL: Starting LVGL task
 ```
 
 插入 USB 摄像头后应看到（验收要求：完整描述符档位清单）：
@@ -130,7 +133,8 @@ cpu0_pct,cpu1_pct,free_heap,free_psram,drop_frames,udp_loss_rate,udp_incomplete_
 - USB passthrough 行：`quality=passthrough`（**绝不伪造质量数值**，以 `jpeg_avg_bytes` 作等效画质指标）、
   `capture_ts_meaning=frame_arrival`；
 - `usb_cam_inherent_latency_ms`：**只能**由光学闭环人工标定后经 `/api/config` 写入，未标定为空——设备侧不存在能直接测得该值的 API；
-- `protocol` 为扫描矩阵维度（http/ws/udp），`tcp_nodelay` 恒 1（流服务已设 TCP_NODELAY）、`lcd_on` 恒 0（本工程无 LCD 子板）。
+- `protocol` 为扫描矩阵维度（http/ws/udp），`tcp_nodelay` 恒 1（流服务已设 TCP_NODELAY）；
+- `lcd_on`：该轮固件是否启用 LCD（`CONFIG_CAMTEST_ENABLE_LCD=y` 且探测到子板为 1，否则 0）——LCD 开销 A/B 对照的分组依据（见 §九）。
 
 串口每秒输出聚合 CSV（无浏览器可用；末尾字段只增不改，旧脚本兼容）：
 `CSV,<t_us>,cap_fps,out_fps,send_fps,mbps,jpeg_avg,drop_cap,drop_out,heap,psram,mode,rssi,WxH,source,usb_mode`；
@@ -187,7 +191,7 @@ cpu0_pct,cpu1_pct,free_heap,free_psram,drop_frames,udp_loss_rate,udp_incomplete_
 - USB 组扫描前先从 UVC 描述符枚举档位，不支持的档不进矩阵；DVP 组不支持的档照旧标 `unsupported`；
 - **协议是扫描维度**：浏览器根据当前行自动切换 http/ws（`/api/status` 的 `scan.cur_protocol` 驱动）；
   udp 行由 `tools/udp_receiver.py --scan` 回传（浏览器无法收 UDP）；
-- 扫描全程 LCD 默认关闭（本工程无 LCD 子板，`lcd_on=0`）；
+- `lcd_on` 列随固件开关如实标注；LCD 开销用「LCD=y 与 LCD=n 各跑一轮同矩阵」对照实测（见 §九「LCD 开销 A/B」）；扫描进行中触屏改参数会被拒绝（`Locked: scan in progress`）；
 - UI 显示两级进度（当前源 / 当前组），结束后自动汇总「DVP vs USB」对比表。
 
 DVP 分辨率档位与虚拟分辨率机制（软件抽取/裁剪）：
@@ -352,6 +356,8 @@ main/
 ├── http_server.c     :80 管理 API（esp_http_server；含 USB 状态/档位/标定值）
 ├── metrics.c         每秒聚合（FPS/码率/CPU/内存/栈水位）+ 串口 CSV + 码率自适应降质（直通模式仅告警）
 ├── scan_ctrl.c       扫描状态机（按源分组矩阵 / 两级进度 / 完整 CSV 表头）
+├── app_config.c      配置持久化（NVS 按字段位合并落盘；Web 与触屏共用同一条 apply 路径）
+├── lcd_ui.c          LCD 预览 + 参数面板 + 触屏调参（esp_lvgl_port + GT1158，见「五点五」）
 ├── web_ui.c / fs_web/index.html   内嵌单页 UI（EMBED_FILES，离线可用；源切换/USB 面板/三段时延/对比视图）
 docs/API_NOTES.md     esp_video/BSP 源码侦察笔记（API 均有出处）
 tools/pi_compare.py   第三方对照测量（HTTP 流，时钟同步法，同口径）
@@ -367,6 +373,33 @@ RESULTS_TEMPLATE.md   实测数据回填模板（Markdown 表 + CSV 表头）
 发送端只取最新帧（丢帧保时延）；帧缓冲/编码输出/客户端发送缓冲全 PSRAM；
 `/stream` 每客户端独立任务（最多 `CAMTEST_MAX_STREAM_CLIENTS`）+ 环形引用计数防撕裂；
 长时间发送靠 socket 超时 + 每帧让出，任务 WDT 放宽到 10 s（理由：大帧 PSRAM→socket 拷贝可超 1 s）。
+
+## 五点五、LCD 显示与触屏（lcd_ui）
+
+**硬件**：4.3" 800×480 RGB 并口 LCD 子板 + GT1158 电容触摸（I2C 0x14，BSP `esp32_s31_korvo_1`
+的 display/touch 能力 + `esp_lvgl_port`）。
+
+**开关与降级**（`CONFIG_CAMTEST_ENABLE_LCD`，Kconfig 默认 y）：
+- 上电先探测触摸芯片——未接子板则 `lcd_ui_start()` 返回 NOT_FOUND，仅日志告警，主流程不受影响；
+- `CONFIG_CAMTEST_LCD_PREVIEW_FPS`（默认 10，0=关）控制预览解码上限；预览双缓冲或硬解引擎
+  创建失败时降级为纯参数面板，编码通路不受影响。
+
+**界面**：左侧 480×270 实时预览（frame_ring 订阅，与流客户端同路径），右侧 320px 参数面板
+（2 Hz 刷新：cap/enc/send FPS、分辨率/质量/限帧、码率、CPU、heap/psram、USB/扫描状态、LCD
+预览 fps/解码耗时）；下排触屏按钮可调 **源（DVP/USB）、USB 模式（passthrough/reencode）、
+分辨率、质量、fps 限帧、高帧率档、毫秒叠加、目标码率**。
+
+**触屏 = Web 同路径**：触屏动作打包成与 `POST /api/config` 完全相同的部分更新 JSON 进队列，
+由 `lcd_cfg` 任务走 `app_config_apply`（全部成功才落盘 `app_config`）；扫描进行中拒绝修改。
+（远程已验证该 apply 路径的 Web 端到端语义；**物理按压与屏幕显示内容需人工目验**。）
+
+**为什么开销低**（设计约束，实测见 §九）：
+1. 预览是 frame_ring 订阅者——acquire 只取「比上次新」的帧，不复制 JPEG 载荷；
+2. 与编码共用 SoC 单例硬件 JPEG 编解码器：`codec_mutex`（二值信号量、无优先级继承），
+   解码只在编码空闲窗口抢到锁才进行——宁可丢预览帧也不挤编码；
+3. 预览任务钉 core1 **最低优先级 2**（采集 14/编码 12 随时抢占），LVGL 渲染任务钉 core0，
+   不占采集/编码核；解码**只丢不排**（超速等下一次通知，时延不累积）；
+4. 限速 `CONFIG_CAMTEST_LCD_PREVIEW_FPS`（默认 10fps），display 走 RGB 并口 DMA 自刷新。
 
 ## 六、精度与误差分析（如实）
 
@@ -392,7 +425,7 @@ RESULTS_TEMPLATE.md   实测数据回填模板（Markdown 表 + CSV 表头）
 | 3 | sensor 帧内**硬件 PCLK 频率**无直接 API | 格式表仅有 `xclk`（20 MHz 输入时钟）；日志打印 xclk 代替，已在 UI 标注 |
 | 4 | Wi-Fi **当前链路 PHY 速率**（Mbps）公开 API | v6.1 未见公开接口（仅 RSSI/PHY 模式）；如需可用 debug 接口或测包估计 |
 | 5 | OV3660 RGB565_BE 经字节交换喂编码器的画质 | 已实现 BE→LE 交换路径，但默认主路径为 YUYV→UYVY，RGB565 路径未逐像素验证 |
-| 6 | LCD 子板（ESP32-S3-LCD-EV-Board-SUB3）本地叠加 | 未接硬件；BSP 支持 display（esp_lvgl_port），接口已预留，暂不默认编译 |
+| 6 | LCD 子板（ESP32-S3-LCD-EV-Board-SUB3）本地叠加 | ✅ 已完成（2026-10-09）：`lcd_ui.c` 预览+参数面板+触屏调参，Kconfig `CAMTEST_ENABLE_LCD` 默认 y（未接子板探测失败不阻塞）；开销 A/B 实测见 §九 |
 | 7 | 编码器 40 ms 单帧超时在 720p 下的真实余量 | 实测见 RESULTS_TEMPLATE（若 720p 频繁错误帧，属驱动常量限制） |
 | 8 | `esp_video_get_dvp_video_device_sensor()` 为私有 API | 2.2.0 固定版本下稳定；升级组件时需复查（CMake 已隔离 include 路径） |
 | 9 | UVC 摄像头 **iProduct 产品名** | espressif/usb 1.5.0 无字符串描述符公共 API（`usb_host_get_string_descriptor` 不存在）；现以 `vid:pid` 代替（如 `1bcf:28c4`）。若需要真名须自行提交控制传输 GET_DESCRIPTOR(String)，见 `source_usb.c` TODO |
@@ -441,6 +474,19 @@ DVP 与 USB UVC 可运行时热切换（`POST /api/config {"source":"usb"|"dvp"}
   无失真全视场的帧率上限是 31fps（L1）——再往上必须裁 V 窗口，这是 OV3660+DVP 的物理约束。
 - 多台小车并发：架构已支持多观看端与 AP 模式，但 2.4 GHz 同频拥塞的量化测试未包含在本轮（预留 RSSI/信道记录）。
 - UDP 分片模式无重传（探索下限用，花屏属预期）。
+- **LCD=y 时 USB 重编码档不可用**：display 启动消耗 ~27 KB 内部 DMA（159195→132575 B）后，
+  最大连续内部 DMA 块 5.6 KB < URB 数据缓冲所需 9216 B（`MALLOC_CAP_DMA|CACHE_ALIGNED|INTERNAL`
+  固定走内部 RAM），`uvc_transfers_allocate` 恒 `ESP_ERR_NO_MEM` → 重编码扫描档全灭
+  （passthrough 档不受影响，实测 14 组完整可比）；LCD=n 固件同矩阵 59/72 组有到达数据。
+- **预览在 1280×720 档可能冻结**：预览硬解输出缓冲需 ~1.88 MB PSRAM 连续块（1280×720×2+余量），
+  扫描/多客户端导致碎片化时分配失败（日志 `解码输出缓冲分配失败`），该档预览停帧，
+  ≤800×600（≤1 MB）自动恢复；预览任务有 NO SIGNAL 超时提示，参数面板不受影响。
+- **`managed_components/espressif__usb_host_uvc/uvc_host.c` 有本地补丁**（`uvc_transfers_free`
+  幂等化：置空 xfers+清零 num_of_xfers——原实现 `uvc_transfers_allocate` 失败路径会经
+  `uvc_device_remove` 二次 free 触发 `heap_caps_free` 断言重启）。`managed_components/` 在
+  .gitignore 中，`idf.py fullclean` 后组件重拉需**重新打该补丁**（或确认上游已修）。
+- **触屏按压与屏幕显示内容未经人工目验**：远程证据仅到 GT1158 I2C 探测成功、LVGL 任务启动、
+  `lcd_prev_fps` 实测 7.5、触屏 apply 与 Web 同路径；上电目验按 §五点五/验收清单核对。
 
 ## 九、结果
 
@@ -459,6 +505,27 @@ DVP 与 USB UVC 可运行时热切换（`POST /api/config {"source":"usb"|"dvp"}
 | UI 热切换 | DVP↔USB 下拉即切、失败回滚、流客户端不断流；连续 6 次往返无重启 | 实测 |
 | 摄像头内部固有延迟 | **未标定**（需按 §四点五.3 流程光学校准，≥10 采样） | 待测 |
 | DVP vs USB 时延对比 | **待数据**（需上述标定 + scope=both 扫描，模板已就绪） | 待测 |
+
+### LCD 开销 A/B 实测（2026-10-09，摄像头 0bda:1376，`scope=usb` 全 72 行矩阵两轮）
+
+**方法**：同一份代码，A 固件 `CONFIG_CAMTEST_ENABLE_LCD=y`（LVGL+预览运行中，`lcd_on=1`）、
+B 固件 `=n`（`lcd_on=0`），各跑一轮完整 USB 扫描；按 (源,分辨率,质量,模式,协议) 对齐，
+**仅统计双侧 capture 与 arrival 均 >0 的 14 组 passthrough**（有效性掩码，B 侧 3 行采样间隙不计、
+A 侧 176×144 udp 尾行退化不计）。原始数据：`docs/scan_ab_lcd_2026-10-09/`。
+
+| 指标 | A(LCD开) vs B(LCD关) | 说明 |
+|---|---|---|
+| capture_fps 绝对值 | **14.50 vs 16.59 fps** | 14 组均值 |
+| capture 相对差 | **−12.6%**（中位 −11.5%，范围 −9.3% ~ −25.5%） | 1280×720 档损失最大 |
+| arrival 相对差 | **−16.6%**（中位 −15.1%，范围 −6.2% ~ −33.3%） | 浏览器/UDP 到达 |
+| latency_mean 差 | **+23.5 ms**（中位 +21.0，范围 −17.6 ~ +83.8 ms） | 时钟同步法，含估算成分 |
+| latency_p95 差 | **+34.2 ms 均值**（中位 +8.8 ms） | 抖动加大 |
+| 重编码 54 组 | A 全部 `ESP_ERR_NO_MEM`（内部 DMA 见 §八）；B 59/72 组有数据 | 两侧行为不同，掩码排除 |
+
+- 预览实测 `lcd_prev_fps` ≈ 7.5（限速 10）、硬解单帧 ~2.7 ms、LVGL 渲染钉 core0；
+- 结论：**LCD 开启对 passthrough 通路的代价约 −12% 采集帧率 / +23 ms 端到端均值**，
+  已通过限速、单例互斥、最低优先级、只丢不排压到位；再降只能降 `CAMTEST_LCD_PREVIEW_FPS`
+  （=0 时编码通路零影响，预览变纯面板）。
 
 ### 已实测参考数据（2026-10-07，本仓库固件，HUAWEI-DKC 2.4G STA，11ax ch1 20MHz，RSSI −34~−40 dBm）
 

@@ -1,5 +1,6 @@
 idf_component_register(
     SRCS "main.c"
+         "app_config.c"
          "camera_pipeline.c"
          "source_if.c"
          "source_dvp.c"
@@ -12,6 +13,7 @@ idf_component_register(
          "metrics.c"
          "scan_ctrl.c"
          "web_ui.c"
+         "lcd_ui.c"
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS "${CMAKE_CURRENT_LIST_DIR}/../managed_components/espressif__esp_video/private_include"
     EMBED_FILES "fs_web/index.html"
