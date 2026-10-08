@@ -260,6 +260,7 @@ OV3660 仅 240×240@24 与 640×480@10（YUYV/RGB565）——矩阵中其余档�
 | 5 | 摄像头 720p@60 档持续 `frame error`（摄像头自带错误帧标记） | 该档 isoc 带宽吃紧（dwMaxVideoFrameSize 虚标 1.8MB），属摄像头 quirks | 默认档选 640×480（@60 实测稳定零丢帧）；720p 可用但建议 fps_limit 限 30 |
 | 6 | **分辨率切换一次失败后 USB 永久打不开**（get_frame_list 持续 `ESP_ERR_INVALID_ARG`） | teardown 在 close 成功前置 `stream=NULL` → worker 停止态排水捞到 pause 前在途回调的竞态帧时句柄已空 → 帧被丢弃永不归还 → 驱动 "Not all frames are returned" → close 永久失败 → 流对象泄漏占住接口 | 句柄生命周期延长到 close 成功；close 重试（10 轮）每轮前重新 drain，配合 worker 排水把竞态帧归还驱动；修复后 30 次连续切换（320/640/720/176/352 混合 + 源往返）零失败 |
 | 7 | 720p@60 持续码率 ~12Mbps 时 **httpd 被挤死**（POST 超时/连接 reset），TCP 到达仅 24fps | 20MHz Wi-Fi 链路过载 + LWIP TCP 窗口 23KB 卡带宽延迟积 | 大于 640×480 的档位自动限 30fps（fps 传值与驱动**同源浮点计算**，避开 FLOAT_EQUAL 精度坑：整数 60.0f 对 166667→59.99988f 差 2.4e-4 不匹配）；TCP SND/WND 23392→49152 |
+| 8 | 真实 UI 环境（多浏览器 tab 持流 + 500ms 状态轮询）下切换分辨率仍可能触发 #6 的流泄漏 | `stream_start`/`encoder_open` 失败路径原为裸 `uvc_host_stream_close`（无 drain）——start 已 unpause 后失败必踩"帧未归还→close 失败→泄漏"；teardown_req 事件丢失时流悬挂无自愈 | 抽 `safe_close_stream()`（多轮 drain+close）统一所有关闭路径；monitor 检测 `want=0 且流悬挂` 自动补 teardown；帧环 3→5 槽（多客户端各持槽引用时 3 槽会 publish 全失败，实测 out_drops 4661）。加固后 18 次快速连切（2 个限速客户端 + 轮询，含 720p）**零失败零丢帧** |
 
 另：显式指定帧率（如 60.0f）在 `uvc_claim_interface` 的描述符匹配中失败过一次（驱动按 `10e6/interval` 的浮点值匹配），故统一传 fps=0 用设备默认帧间隔。
 
@@ -440,7 +441,7 @@ DVP 与 USB UVC 可运行时热切换（`POST /api/config {"source":"usb"|"dvp"}
 | USB passthrough 320×240@60 | 设备 cap **59.8~60.0fps**；HTTP 到达 **46~54fps**（间隔 p95=1 帧） | 实测 2026-10-08 |
 | USB passthrough 640×480@60 | 设备 cap **60.0fps** 满帧（URB 扩容 4→8 后由 54.8 提升）；HTTP 到达 **40.7~45.5fps**（TCP 窗口 48KB 后由 24.7 提升；间隔 p95=2 帧）；室内弱光自动曝光降至 13~15fps 属摄像头行为 | 实测 2026-10-08 |
 | USB passthrough 1280×720@30 | 设备 cap 24.9~30.0fps（大档自动限 30fps，见工程实录 #7）；HTTP 到达 22fps；60fps 档会挤死 httpd 不再使用 | 实测 2026-10-08 |
-| 分辨率切换压力 | 30 次连续切换（320/640/720/176/352 混合 + DVP↔USB 源往返，含拉流客户端活跃场景）**零失败** | 实测 2026-10-08 |
+| 分辨率切换压力 | 30 次连续切换（混合档位 + 源往返）零失败；加固后再压 18 次快速连切（2 个限速流客户端 + 500ms 状态轮询并发，模拟真实 UI 双 tab）**零失败、全程零丢帧** | 实测 2026-10-08 |
 | USB reencode 640×480 q20/q30 | 5.0fps 编码发布（YUY2@10fps 档）、9.2~10.5 kB/帧、CPU 5~7/24%、零丢帧 | 设备侧，实测 |
 | UI 热切换 | DVP↔USB 下拉即切、失败回滚、流客户端不断流；连续 6 次往返无重启 | 实测 |
 | 摄像头内部固有延迟 | **未标定**（需按 §四点五.3 流程光学校准，≥10 采样） | 待测 |

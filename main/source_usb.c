@@ -517,6 +517,27 @@ static int drain_work_queue(uvc_host_stream_hdl_t h)
     return n;
 }
 
+/* 安全关流：多轮 drain+close 直到成功（帧不归还时 close 报 INVALID_STATE 且不释放流对象；
+ * 放弃重试 = 流永久泄漏占住接口 → 之后所有 get_frame_list/open 报 INVALID_ARG）。
+ * 调用前须已 worker_run=false（worker 排水循环会归还漏网的竞态帧）。 */
+static bool safe_close_stream(uvc_host_stream_hdl_t h)
+{
+    if (!h) return true;
+    for (int i = 0; i < 10; i++) {
+        int leaked = drain_work_queue(h);
+        if (leaked) {
+            ESP_LOGW(TAG, "safe_close：第 %d 轮追回 %d 个竞态帧", i, leaked);
+            vTaskDelay(pdMS_TO_TICKS(30));   /* 给 worker 排水循环时间再捞一轮 */
+            continue;
+        }
+        if (uvc_host_stream_close(h) == ESP_OK) return true;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGE(TAG, "stream_close 10 轮仍失败（帧未归还）——流对象可能泄漏，"
+             "若反复出现请重新插拔摄像头");
+    return false;
+}
+
 static void teardown_stream(void)
 {
     ESP_LOGW(TAG, "teardown_stream 被调用（stream=%d want=%d）",
@@ -533,30 +554,7 @@ static void teardown_stream(void)
         while (s_u.worker_busy && wait++ < 100) vTaskDelay(pdMS_TO_TICKS(10));
 
         s_u.stream_up = false;
-        /* 多轮排空 + close 重试：pause 前在途的 driver 回调可能在 stop 返回后才把
-         * 竞态帧送进队列；worker 排水循环也会把它归还驱动。close 要求全部归还，
-         * 每轮重试前再 drain 兜底 */
-        bool closed = false;
-        for (int i = 0; i < 10 && !closed; i++) {
-            int leaked = drain_work_queue(h);
-            if (leaked) {
-                ESP_LOGW(TAG, "teardown：第 %d 轮追回 %d 个竞态帧", i, leaked);
-                vTaskDelay(pdMS_TO_TICKS(30));   /* 给 worker 排水循环时间再捞一轮 */
-                continue;
-            }
-            esp_err_t err = uvc_host_stream_close(h);
-            if (err == ESP_OK) {
-                closed = true;
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-        }
-        if (!closed) {
-            /* 极端场景（设备半死 + 帧卡死）：放弃 close，流对象泄漏但记录在案；
-             * 设备重插后驱动侧 DEV_GONE 会强制回收该流 */
-            ESP_LOGE(TAG, "stream_close 10 轮仍失败（帧未归还）——流对象可能泄漏，"
-                     "若反复出现请重新插拔摄像头");
-        }
+        safe_close_stream(h);
         s_u.stream = NULL;   /* ★ close 之后才置 NULL */
     } else {
         s_u.stream_up = false;
@@ -648,7 +646,9 @@ static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
     err = uvc_host_stream_start(h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "stream_start failed (%s)", esp_err_to_name(err));
-        uvc_host_stream_close(h);
+        s_u.worker_run = false;   /* 先停 worker，safe_close 依赖其排水归还竞态帧 */
+        uvc_host_stream_stop(h);  /* start 失败也可能已 unpause 送帧：先停再关 */
+        safe_close_stream(h);
         s_u.stream = NULL;
         return err;
     }
@@ -657,10 +657,9 @@ static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
         err = encoder_open(out_w, out_h, s_u.quality);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "encoder_open failed");
+            s_u.worker_run = false;
             uvc_host_stream_stop(h);
-            uvc_host_frame_t *f;
-            while (xQueueReceive(s_u.work_q, &f, 0) == pdTRUE) uvc_host_frame_return(h, f);
-            uvc_host_stream_close(h);
+            safe_close_stream(h);
             s_u.stream = NULL;
             return err;
         }
@@ -849,6 +848,12 @@ static void monitor_task(void *arg)
             teardown_stream();
             xSemaphoreGive(s_u.lock);
             s_u.next_retry_us = esp_timer_get_time() + RETRY_BACKOFF_MS * 1000;
+        }
+        /* 自愈：want=0 但流仍悬挂（teardown_req 事件丢失/竞态）→ 补做清理，
+         * 否则泄漏流会占住接口使后续 open 永久失败 */
+        if (!s_u.want_stream && s_u.stream && !s_u.teardown_req) {
+            ESP_LOGW(TAG, "自愈：want=0 但流仍悬挂，补做 teardown");
+            s_u.teardown_req = true;
         }
 
         /* 自动（重）连接：USB 为当前源 && 有设备 && 未推流 → 周期性尝试 */

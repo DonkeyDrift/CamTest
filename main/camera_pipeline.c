@@ -617,9 +617,11 @@ esp_err_t cam_pipe_init(void)
         return ESP_ERR_NOT_SUPPORTED;
     }
     /* USB UVC 共用此帧环：部分摄像头 640x480 MJPEG 帧可超过 DVP 口径（238KB），
-     * 抬高槽容量下限（PSRAM 16MB 充裕；槽只增不改，帧环永不销毁） */
+     * 抬高槽容量下限（PSRAM 16MB 充裕；槽只增不改，帧环永不销毁）。
+     * 槽数 5：多流客户端（UI 双 tab）各持 1 槽引用时，3 槽环会被拖到 publish
+     * 全失败（真机实测 out_drops 4661）；5 槽留足写者余量，PSRAM 代价 ~1.9MB */
     if (max_cap < 384 * 1024) max_cap = 384 * 1024;
-    s_p.ring = frame_ring_create(3, max_cap);
+    s_p.ring = frame_ring_create(5, max_cap);
     ESP_RETURN_ON_FALSE(s_p.ring, ESP_ERR_NO_MEM, TAG, "frame ring %ukB x3", (unsigned)(max_cap / 1024));
     s_p.free_in = xQueueCreate(JPEG_IN_BUFS, sizeof(int));
     s_p.enc_trigger = xSemaphoreCreateCounting(JPEG_IN_BUFS, 0);
