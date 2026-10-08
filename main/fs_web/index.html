@@ -555,6 +555,20 @@ function renderStatus(){
   /* 支持档随采集源变化：列表变化时重建下拉（保持选中项），否则源切换后仍列旧源档位 */
   const rsig=(dev.source||"")+"|"+((d.supported_res||[]).join(","));
   if(rsig!==S.resOptSig){ S.resOptSig=rsig; buildResOptions({source:dev.source}); }
+  /* 控件跟随后端真实状态（用户正在编辑的除外）：扫描矩阵/失败回滚/API 操作都会
+     改变源·模式·分辨率，不回弹会让下拉与横幅脱节，"应用配置"还会把陈旧选项
+     （如 0x0（当前））误发给设备 */
+  if(!$("cSrc").dataset.editing && dev.source && $("cSrc").value!==(dev.source==="usb"?"usb":"dvp"))
+    $("cSrc").value=dev.source==="usb"?"usb":"dvp";
+  if(!$("cRes").dataset.editing && dev.res && dev.res!=="0x0" && $("cRes").value!==dev.res){
+    const opts=[...$("cRes").options].map(o=>o.value);
+    if(opts.includes(dev.res)) $("cRes").value=dev.res;
+    else buildResOptions({source:dev.source,res:dev.res});
+  }
+  if(!$("cUsbMode").dataset.editing && dev.usb_mode){
+    const mv=dev.usb_mode==="reencode"?"reencode":"passthrough";
+    if($("cUsbMode").value!==mv) $("cUsbMode").value=mv;
+  }
   banner(null);
   const srcName=dev.source==="usb"?("USB "+(dev.usb_device||"")):("DVP "+(dev.sensor||"?"));
   $("bSource").innerHTML="源 <b>"+srcName+"</b>"+(dev.scaled?"·缩放":"");

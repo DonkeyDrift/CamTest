@@ -118,6 +118,8 @@ struct usb_priv_s {
     uint32_t disconnects;
     uint32_t open_errors;
     uint32_t overflow_events;
+    volatile int frames_held;                   /* frame_cb 交出、尚未归还驱动的帧数（0 才能 close） */
+    volatile uint32_t cb_nohandle;              /* frame_cb 无句柄防御路径触发次数（应恒为 0） */
 
     /* 叠加与标定 */
     bool overlay;
@@ -361,15 +363,33 @@ static void stream_event_cb(const uvc_host_stream_event_data_t *event, void *use
     }
 }
 
+/* 帧归还唯一出口：任何路径漏归还都会让 uvc_host_stream_close 永久失败
+ * （"Not all frames are returned" → 流对象泄漏占住接口 → 之后 open 永久
+ * INVALID_ARG），所以统一从此走并记账，close 前 frames_held 必须归零 */
+static inline void ret_frame(uvc_host_stream_hdl_t h, uvc_host_frame_t *f)
+{
+    if (h) {
+        uvc_host_frame_return(h, f);
+    } else {
+        s_u.cb_nohandle++;   /* 无句柄可归还：禁止静默，计数暴露 */
+    }
+    if (s_u.frames_held > 0) s_u.frames_held--;
+}
+
 static bool frame_cb(const uvc_host_frame_t *frame, void *user_ctx)
 {
     /* ★ U4 打点：完整一帧到达 ESP32 的时刻（含摄像头内部曝光/ISP/编码/USB 传输延迟） */
     s_u.stats.cap_frames++;
     uvc_host_stream_hdl_t h = s_u.stream;
-    if (!h) return false;   /* 收尾中的竞态：帧随 stream_close 一起释放 */
+    if (!h) {
+        /* 防御：驱动只在流存在时回调。真发生则帧无法归还——计数暴露勿静默 */
+        s_u.cb_nohandle++;
+        return false;
+    }
+    s_u.frames_held++;
     if (xQueueSend(s_u.work_q, &frame, 0) != pdPASS) {
         s_u.stats.cap_drops++;      /* 队列满：丢帧保时延 */
-        uvc_host_frame_return(h, (uvc_host_frame_t *)frame);
+        ret_frame(h, (uvc_host_frame_t *)frame);
     }
     return false;   /* 帧由 worker 用完显式归还 */
 }
@@ -396,6 +416,7 @@ static void encoder_close(void)
 static esp_err_t encoder_open(int w, int h, uint8_t quality)
 {
     ESP_LOGI(TAG, "encoder_open: %dx%d q%u（/dev/video10）", w, h, quality);
+    if (s_u.enc_fd >= 0) encoder_close();   /* 重入防护：上次 teardown 时 worker 忙未关 */
     s_u.enc_fd = open(ESP_VIDEO_JPEG_DEVICE_NAME, O_RDWR);   /* /dev/video10 */
     ESP_RETURN_ON_FALSE(s_u.enc_fd >= 0, ESP_FAIL, TAG, "open %s", ESP_VIDEO_JPEG_DEVICE_NAME);
     struct timeval tv = { .tv_sec = 0, .tv_usec = ENC_DQBUF_TIMEOUT_MS * 1000 };
@@ -511,7 +532,7 @@ static int drain_work_queue(uvc_host_stream_hdl_t h)
     uvc_host_frame_t *f;
     int n = 0;
     while (xQueueReceive(s_u.work_q, &f, 0) == pdTRUE) {
-        if (h) uvc_host_frame_return(h, f);
+        ret_frame(h, f);
         n++;
     }
     return n;
@@ -523,7 +544,7 @@ static int drain_work_queue(uvc_host_stream_hdl_t h)
 static bool safe_close_stream(uvc_host_stream_hdl_t h)
 {
     if (!h) return true;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 20; i++) {
         int leaked = drain_work_queue(h);
         if (leaked) {
             ESP_LOGW(TAG, "safe_close：第 %d 轮追回 %d 个竞态帧", i, leaked);
@@ -533,15 +554,15 @@ static bool safe_close_stream(uvc_host_stream_hdl_t h)
         if (uvc_host_stream_close(h) == ESP_OK) return true;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    ESP_LOGE(TAG, "stream_close 10 轮仍失败（帧未归还）——流对象可能泄漏，"
-             "若反复出现请重新插拔摄像头");
+    ESP_LOGE(TAG, "stream_close 20 轮仍失败（held=%d nohandle=%u）——保留句柄待迟到帧归还后重试",
+             s_u.frames_held, (unsigned)s_u.cb_nohandle);
     return false;
 }
 
 static void teardown_stream(void)
 {
-    ESP_LOGW(TAG, "teardown_stream 被调用（stream=%d want=%d）",
-             s_u.stream ? 1 : 0, (int)s_u.want_stream);
+    ESP_LOGW(TAG, "teardown_stream 被调用（stream=%d want=%d held=%d）",
+             s_u.stream ? 1 : 0, (int)s_u.want_stream, s_u.frames_held);
     s_u.worker_run = false;
     if (s_u.stream) {
         uvc_host_stream_hdl_t h = s_u.stream;
@@ -552,19 +573,41 @@ static void teardown_stream(void)
          * 先等 busy 再 drain：worker 手中帧归还路径用的是它自己取的 h，与队列无关 */
         int wait = 0;
         while (s_u.worker_busy && wait++ < 100) vTaskDelay(pdMS_TO_TICKS(10));
+        bool worker_idle = !s_u.worker_busy;
 
         s_u.stream_up = false;
-        safe_close_stream(h);
-        s_u.stream = NULL;   /* ★ close 之后才置 NULL */
+        if (safe_close_stream(h)) {
+            s_u.stream = NULL;
+        } else {
+            /* ★ close 失败时【保留句柄】：worker/迟到回调的漏网帧仍可归还，monitor 周期
+             * 重试 close，凑齐即恢复。此前置 NULL 会把漏网帧锁死 → 永久楔死（真机实测） */
+            ESP_LOGE(TAG, "close 未完成，保留流句柄（held=%d），monitor 将重试", s_u.frames_held);
+        }
+        if (worker_idle) {
+            encoder_close();   /* 必须在 worker 完全停手之后（编码器只被 worker 访问） */
+        } else {
+            ESP_LOGW(TAG, "worker 仍忙碌，编码器暂不关闭（monitor 重试时补关）");
+        }
     } else {
         s_u.stream_up = false;
+        encoder_close();
     }
-    encoder_close();   /* 必须在 worker 完全停手之后（编码器只被 worker 访问） */
 }
 
 static esp_err_t open_stream_locked(void)
 {
     if (!s_u.dev_present) return ESP_ERR_NOT_FOUND;
+
+    /* 上次 close 未完成（漏网帧在途、句柄保留）：先补关再开——流对象仍占着接口，
+     * 不补关则 get_frame_list/open 必报 INVALID_ARG。迟到帧凑齐即在此恢复 */
+    if (s_u.stream) {
+        s_u.worker_run = false;
+        if (safe_close_stream(s_u.stream)) {
+            s_u.stream = NULL;
+        } else {
+            return ESP_FAIL;
+        }
+    }
 
     /* 部分 UVC 设备有多个流索引（复合 function），仅其一可用：逐个尝试直到
      * open+start 成功（协商控制传输超时 = 该 function 是哑通道，换下一个） */
@@ -648,8 +691,7 @@ static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
         ESP_LOGE(TAG, "stream_start failed (%s)", esp_err_to_name(err));
         s_u.worker_run = false;   /* 先停 worker，safe_close 依赖其排水归还竞态帧 */
         uvc_host_stream_stop(h);  /* start 失败也可能已 unpause 送帧：先停再关 */
-        safe_close_stream(h);
-        s_u.stream = NULL;
+        if (safe_close_stream(h)) s_u.stream = NULL;   /* 失败则保留句柄待迟到帧 */
         return err;
     }
 
@@ -659,8 +701,7 @@ static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
             ESP_LOGE(TAG, "encoder_open failed");
             s_u.worker_run = false;
             uvc_host_stream_stop(h);
-            safe_close_stream(h);
-            s_u.stream = NULL;
+            if (safe_close_stream(h)) s_u.stream = NULL;   /* 失败则保留句柄待迟到帧 */
             return err;
         }
     }
@@ -673,8 +714,12 @@ static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
     s_u.next_due_us = 0;
     rebuild_tiers();   /* ★ 必须先于 stream_up=true：switch 返回后上层立即查档位表 */
     s_u.stream_up = true;
+    /* ★ 开流收尾必须【归还】open 期间（stream_start 起即有帧流入，encoder_open/档位
+     * 日志可达数百 ms）排队的帧，绝不能 xQueueReset 静默丢弃——丢弃=帧永不归还=
+     * 下次 close 永久失败=流泄漏接口占死（真机楔死根因之一） */
+    int stale = drain_work_queue(s_u.stream);
+    if (stale) ESP_LOGW(TAG, "开流收尾归还 %d 个排队帧", stale);
     s_u.worker_run = true;
-    xQueueReset(s_u.work_q);
     bool scaled = (out_w != fi->h_res || out_h != fi->v_res);
     ESP_LOGI(TAG, "UVC 推流开始（流索引 %u）：%s %ux%u%s%s quality=%u fps_limit=%d",
              stream_idx,
@@ -694,7 +739,7 @@ static void worker_task(void *arg)
              * （s_u.stream 在 close 成功前保持有效——见 teardown_stream 注释） */
             uvc_host_stream_hdl_t h = s_u.stream;
             while (xQueueReceive(s_u.work_q, &f, 0) == pdTRUE) {
-                if (h) uvc_host_frame_return(h, f);
+                ret_frame(h, f);
             }
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
@@ -711,7 +756,7 @@ static void worker_task(void *arg)
         if (s_u.fps_limit > 0) {
             if (s_u.next_due_us == 0) s_u.next_due_us = t_arr;
             if (t_arr < s_u.next_due_us) {
-                if (h) uvc_host_frame_return(h, f);
+                ret_frame(h, f);
                 s_u.worker_busy = false;
                 continue;
             }
@@ -731,13 +776,13 @@ static void worker_task(void *arg)
             s_u.stats.proc_acc_us += t1 - t0;
             if (ok) s_u.stats.out_frames++; else s_u.stats.out_drops++;
             s_u.stats.out_bytes += f->data_len;
-            if (h) uvc_host_frame_return(h, f);
+            ret_frame(h, f);
         } else {
             /* ★ 模式 B：YUY2 → 硬件 JPEG 重编码（quality 可控，与 DVP 同档可比） */
             int idx;
             if (!h || xQueueReceive(s_u.enc_free_in, &idx, 0) != pdTRUE) {
                 s_u.stats.cap_drops++;   /* 编码器忙：丢帧保时延 */
-                if (h) uvc_host_frame_return(h, f);
+                ret_frame(h, f);
                 s_u.worker_busy = false;
                 continue;
             }
@@ -765,7 +810,7 @@ static void worker_task(void *arg)
                              errno, (unsigned)out_bytes, (unsigned)s_u.enc_in[idx].length);
                 xQueueSend(s_u.enc_free_in, &idx, 0);
                 s_u.stats.cap_drops++;
-                uvc_host_frame_return(h, f);
+                ret_frame(h, f);
                 s_u.worker_busy = false;
                 continue;
             }
@@ -787,7 +832,7 @@ static void worker_task(void *arg)
             }
             uint64_t t_enc = esp_timer_get_time();
             xQueueSend(s_u.enc_free_in, &idx, 0);
-            uvc_host_frame_return(h, f);
+            ret_frame(h, f);
 
             if (enc_ok && ob.bytesused > 0 && !(ob.flags & V4L2_BUF_FLAG_ERROR)) {
                 bool scaled = (s_u.out_w != s_u.w || s_u.out_h != s_u.h);
@@ -842,22 +887,31 @@ static void monitor_task(void *arg)
             last_hb = esp_timer_get_time();
         }
 
-        if (s_u.teardown_req) {
-            s_u.teardown_req = false;
-            xSemaphoreTake(s_u.lock, portMAX_DELAY);
-            teardown_stream();
-            xSemaphoreGive(s_u.lock);
-            s_u.next_retry_us = esp_timer_get_time() + RETRY_BACKOFF_MS * 1000;
-        }
-        /* 自愈：want=0 但流仍悬挂（teardown_req 事件丢失/竞态）→ 补做清理，
-         * 否则泄漏流会占住接口使后续 open 永久失败 */
-        if (!s_u.want_stream && s_u.stream && !s_u.teardown_req) {
-            ESP_LOGW(TAG, "自愈：want=0 但流仍悬挂，补做 teardown");
-            s_u.teardown_req = true;
+        /* 清理请求 / 自愈（want=0 但流悬挂）/ close 重试（close 未完成句柄保留中）：
+         * 条件必须在【锁内】重新求值再执行——set_mode/apply 的同步 teardown+open 与
+         * 本任务并发时，锁外读到的旧条件会误杀刚打开的新流（真机实测：每次切换后
+         * 12~16 ms 新流即被"want=1"的误 teardown 杀掉再重开，快速连切时叠加成泄漏） */
+        bool urgent = s_u.teardown_req || !s_u.want_stream;
+        if (s_u.teardown_req || (!s_u.want_stream && s_u.stream) ||
+            (s_u.stream && !s_u.stream_up)) {
+            if (urgent || esp_timer_get_time() >= s_u.next_retry_us) {
+                xSemaphoreTake(s_u.lock, portMAX_DELAY);
+                bool need = s_u.teardown_req || (!s_u.want_stream && s_u.stream) ||
+                            (s_u.stream && !s_u.stream_up);
+                s_u.teardown_req = false;
+                if (need) {
+                    ESP_LOGW(TAG, "monitor：teardown（want=%d up=%d）",
+                             (int)s_u.want_stream, (int)s_u.stream_up);
+                    teardown_stream();
+                }
+                xSemaphoreGive(s_u.lock);
+                s_u.next_retry_us = esp_timer_get_time() + RETRY_BACKOFF_MS * 1000;
+            }
         }
 
-        /* 自动（重）连接：USB 为当前源 && 有设备 && 未推流 → 周期性尝试 */
-        if (s_u.want_stream && s_u.dev_present && !s_u.stream_up && !s_u.teardown_req) {
+        /* 自动（重）连接：USB 为当前源 && 有设备 && 未推流 && 无残留流句柄 → 周期尝试
+         * （残留句柄=上次 close 未完成，接口仍被占，open 必失败，先等上面补关） */
+        if (s_u.want_stream && s_u.dev_present && !s_u.stream_up && !s_u.teardown_req && !s_u.stream) {
             int64_t now = esp_timer_get_time();
             if (now >= s_u.next_retry_us) {
                 xSemaphoreTake(s_u.lock, portMAX_DELAY);
@@ -1008,8 +1062,8 @@ esp_err_t source_usb_apply(int w, int h, uint8_t quality, int fps_limit)
         } else {
             err = ESP_ERR_NOT_FOUND;
         }
+        s_u.want_stream = true;   /* ★ 锁内恢复（失败时 monitor 会按 want 重试），防 monitor 误杀新流 */
         xSemaphoreGive(s_u.lock);
-        s_u.want_stream = true;   /* 恢复活动（失败时 monitor 会按 want 重试） */
         if (err != ESP_OK) return err;
     }
     return ESP_OK;
@@ -1156,13 +1210,13 @@ esp_err_t source_usb_set_mode(usb_mode_t m)
     if (m == s_u.mode) return ESP_OK;
     bool was_active = s_u.want_stream;
     usb_mode_t old = s_u.mode;
-    s_u.mode = m;
     if (was_active && s_u.dev_present) {
         /* 同步重开（不经 monitor 异步）：新模式失败回滚旧模式 */
         s_u.want_stream = false;
         s_u.teardown_req = false;
         xSemaphoreTake(s_u.lock, portMAX_DELAY);
         teardown_stream();
+        s_u.mode = m;   /* ★ 旧流完全停手后再切换：否则 worker 把旧格式帧走错分支 */
         esp_err_t err = open_stream_locked();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "切换到 %s 失败（%s），回滚 %s",
@@ -1172,10 +1226,11 @@ esp_err_t source_usb_set_mode(usb_mode_t m)
             s_u.mode = old;
             err = open_stream_locked();   /* 尽力回滚 */
         }
+        s_u.want_stream = true;   /* ★ 锁内恢复：monitor 锁内求值不会误杀刚开的流 */
         xSemaphoreGive(s_u.lock);
-        s_u.want_stream = true;
         return err;
     }
+    s_u.mode = m;
     return ESP_OK;
 }
 
