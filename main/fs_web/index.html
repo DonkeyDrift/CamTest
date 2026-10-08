@@ -864,6 +864,16 @@ async function init(){
     const out=$("calOut");
     if(S.offsetUs==null){ out.textContent="尚未完成时钟同步（看顶部 clock 徽章），稍候再记录"; out.style.color="var(--err)"; return; }
     if(isNaN(c)||isNaN(s)){ out.textContent="请把照片里读到的两个数都填上（秒，3 位小数）"; out.style.color="var(--err)"; return; }
+    /* 同步健康防护：e2e < 编码耗时物理不可能（到达必晚于编码），说明本页 offset 偏差过大，
+     * 直接采样会把同步误差灌进①。等窗口收敛或换同步正常的机器 */
+    const now=(performance.timeOrigin+performance.now())*1000;
+    const w1=S.frames.filter(f=>f.arrive>=now-1e6);
+    const e2e=w1.length?mean(w1.map(f=>f.lat/1000)):null;
+    const esp=w1.length?mean(w1.map(f=>f.enc/1000)):null;
+    if(e2e!=null&&esp!=null&&e2e<esp+1){
+      out.innerHTML=`<span style="color:var(--err)">本页时钟同步异常（e2e=${fmtN(e2e,1)}ms &lt; 编码 ${fmtN(esp,1)}ms，物理不可能）——刷新页面等窗口重建，或换一台 e2e&gt;编码 的机器再采样</span>`;
+      return;
+    }
     const d=c-s-S.offsetUs/1000;
     S.calSamples.push(d);
     const m=mean(S.calSamples), sd=std(S.calSamples);
