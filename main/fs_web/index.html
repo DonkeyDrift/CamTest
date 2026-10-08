@@ -617,7 +617,9 @@ function buildResOptions(dev){
   /* ★ innerHTML 重建会把选中项重置回第一项——必须恢复，否则每次应用后下拉
      回弹到首项，下一次 applyConfig 会把首项分辨率误发给设备（分辨率"切不动"根因）。
      当前档不在列表（跨源虚拟档）时追加"（当前）"选项，保证后续应用不改分辨率 */
-  const want=(dev&&dev.res)||prev;
+  const live=S.status&&S.status.device&&S.status.device.res;
+  let want=(dev&&dev.res)||live||prev;
+  if(want==="0x0") want=(prev&&prev!=="0x0")?prev:(sup[0]||"");   /* 0x0=切换中/未推流，非真实档位，禁止当"当前" */
   if(want&&sup.includes(want)) $("cRes").value=want;
   else if(want){ $("cRes").innerHTML+=`<option value="${want}">${want}（当前）</option>`; $("cRes").value=want; }
 }
@@ -784,16 +786,17 @@ async function init(){
     if(isNaN(v)||v<0) return;
     try{ await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({usb_inherent_ms:v})}); $("cInh").dataset.editing=""; }catch(e){}
   };
-  $("cSrc").onfocus=e=>e.target.dataset.editing=1;
-  $("cSrc").onchange=e=>delete e.target.dataset.editing;
-  $("cUsbMode").onfocus=e=>e.target.dataset.editing=1;
-  $("cUsbMode").onchange=e=>delete e.target.dataset.editing;
+  /* focus=用户正在编辑：renderStatus 不回弹该控件；change/blur 后恢复跟随真实状态 */
+  ["cSrc","cUsbMode","cRes"].forEach(id=>{
+    $(id).onfocus=e=>e.target.dataset.editing=1;
+    $(id).onblur=e=>delete e.target.dataset.editing;
+  });
   $("cQ").oninput=e=>$("cQv").textContent=e.target.value;
   $("cTr").onchange=e=>{S.transport=e.target.value;switchTransport();};
   $("bScan").onclick=startScan;
   $("bScanStop").onclick=stopScan;
   /* 改动即应用：消灭"选好未点应用被 500ms 轮询回弹"的竞态（扫描中禁用） */
-  const autoApply=()=>{ if(!scanActive()) applyConfig(); };
+  const autoApply=e=>{ delete e.target.dataset.editing; if(!scanActive()) applyConfig(); };
   $("cSrc").onchange=autoApply;        /* 采集源切换即应用（含回滚提示） */
   $("cUsbMode").onchange=autoApply;    /* USB 模式切换即应用 */
   $("cRes").onchange=autoApply;
