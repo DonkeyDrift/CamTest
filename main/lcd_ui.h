@@ -10,6 +10,7 @@
  */
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -21,10 +22,16 @@ typedef struct {
     bool  preview_on;     /* 预览解码任务在跑（CAMTEST_LCD_PREVIEW_FPS>0 且缓冲分配成功） */
     float preview_fps;    /* 最近 1 s 实际解码帧率 */
     float dec_ms;         /* 单帧硬解耗时 EMA（ms） */
+    uint32_t flush_cnt;   /* 面板 draw_bitmap 调用计数（LVGL flush + 测试图案） */
+    uint32_t flush_err;   /* 其中失败次数（>0 = 帧缓冲写入有问题） */
 } lcd_ui_stats_t;
 
 /* app_main 末尾调用一次；错误码仅用于日志（NOT_FOUND=未接 LCD 属正常） */
 esp_err_t lcd_ui_start(void);
+
+/* 直写测试图案（绕过 LVGL）停留 hold_ms 后自动恢复 UI；
+ * 黑屏诊断用：彩条可见 = 面板/时序/背光正常，问题在 LVGL 侧 */
+void lcd_ui_test_pattern(int hold_ms);
 
 lcd_ui_stats_t lcd_ui_stats(void);
 bool lcd_ui_active(void);   /* http status / 扫描 CSV 的 lcd_on 列 */

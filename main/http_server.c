@@ -6,6 +6,7 @@
  *   GET  /overlay         光学闭环校验说明页 + 叠加开关
  *   GET  /api/sync        {"t_dev_us":…, "t_wall_ms":…}   时钟同步（Christian）
  *   GET  /api/status      JSON 实时状态（采集源 + USB 状态 + 扫描进度）
+ *   GET  /api/lcdtest?ms=3000  LCD 测试图案直写面板（黑屏诊断：彩条可见=面板/背光正常）
  *   POST /api/config      {"source","res","quality","fps_limit","overlay","target_mbps",
  *                         "usb_mode","usb_inherent_ms","boost"/"hifps"/"vts"(DVP 实验)}
  *   GET  /api/scan/start?modes=sta[,ap]&scope=dvp|usb|both
@@ -20,6 +21,7 @@
 #include "http_server.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
@@ -168,6 +170,7 @@ static esp_err_t h_status(httpd_req_t *req)
         "\"uptime_s\":%u,\"rst_reason\":%d,"
         "\"overlay\":%s,\"target_mbps\":%.1f,\"gov_last\":\"%s\",\"hifps\":%d,"
         "\"tcp_nodelay\":1,\"lcd_on\":%d,\"lcd_prev_fps\":%.1f,\"lcd_dec_ms\":%.1f,"
+        "\"lcd_flush\":%u,\"lcd_flush_err\":%u,"
         "\"wifi\":{\"mode\":\"%s\",\"phy\":\"%s\",\"channel\":%d,\"band_mhz\":%d,\"rssi\":%d,\"ssid\":\"%s\"},"
         "\"ip\":\"%s\",\"mdns\":\"%s.local\","
         "\"clients\":[%s],"
@@ -186,6 +189,7 @@ static esp_err_t h_status(httpd_req_t *req)
         m->stack_cap, m->stack_enc, (unsigned)m->uptime_s, esp_reset_reason(),
         src_if_overlay() ? "true" : "false", m->target_mbps, m->gov_last, cam_boost_level(),
         lcd.active ? 1 : 0, lcd.preview_fps, lcd.dec_ms,
+        (unsigned)lcd.flush_cnt, (unsigned)lcd.flush_err,
         w->mode == WIFI_MODE_STA_M ? "STA" : "AP", w->phy, w->channel, w->band_mhz,
         w->rssi, w->ssid, w->ip, CONFIG_CAMTEST_MDNS_HOSTNAME, clients,
         esp_get_idf_version());
@@ -400,12 +404,28 @@ static esp_err_t h_scan_report(httpd_req_t *req)
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+/* ---------------- /api/lcdtest（黑屏诊断：直写测试图案） ---------------- */
+static esp_err_t h_lcdtest(httpd_req_t *req)
+{
+    int ms = 3000;
+    char q[64] = {0};
+    if (httpd_req_get_url_query_str(req, q, sizeof(q) - 1) == ESP_OK) {
+        char v[16] = {0};
+        if (httpd_query_key_value(q, "ms", v, sizeof(v) - 1) == ESP_OK) ms = atoi(v);
+    }
+    lcd_ui_test_pattern(ms);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true,\"note\":\"pattern drawn direct to panel; bars visible = panel+backlight OK\"}",
+                           HTTPD_RESP_USE_STRLEN);
+}
+
 /* ---------------- 注册 ---------------- */
 static const httpd_uri_t s_uris[] = {
     { .uri = "/",                .method = HTTP_GET,  .handler = h_index },
     { .uri = "/overlay",         .method = HTTP_GET,  .handler = h_overlay },
     { .uri = "/api/sync",        .method = HTTP_GET,  .handler = h_sync },
     { .uri = "/api/status",      .method = HTTP_GET,  .handler = h_status },
+    { .uri = "/api/lcdtest",     .method = HTTP_GET,  .handler = h_lcdtest },
     { .uri = "/api/config",      .method = HTTP_POST, .handler = h_config },
     { .uri = "/api/scan/start",  .method = HTTP_GET,  .handler = h_scan_start },
     { .uri = "/api/scan/stop",   .method = HTTP_GET,  .handler = h_scan_stop },

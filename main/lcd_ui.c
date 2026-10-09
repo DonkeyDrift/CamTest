@@ -41,8 +41,13 @@
 #include "esp_heap_caps.h"
 #include "driver/i2c_master.h"
 #include "driver/jpeg_decode.h"
+#include "esp_lcd_types.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_interface.h"   /* esp_lcd_panel_t vtable（flush shim 需要） */
+#include "esp_lvgl_port.h"
 #include "lvgl.h"
 #include "bsp/esp32_s31_korvo_1.h"
+#include "bsp/touch.h"
 #include "cJSON.h"
 #include "app_config.h"
 #include "camera_pipeline.h"
@@ -106,6 +111,75 @@ static lv_obj_t *w_usb[3], *w_dvp[4];           /* 条件显隐的两组行 */
 static lv_obj_t *l_status;
 static bool s_nosig_shown = true;
 static int s_prev_src = -1, s_prev_um = -1, s_prev_ov = -1, s_prev_vis = -1, s_st_col = -1;
+
+/* ---------------- 面板直通 + flush 观测 + 测试图案 ----------------
+ * esp_lvgl_port 的 flush 忽略 draw_bitmap 返回值：写帧缓冲失败会"静默黑屏"、
+ * LVGL 照常心跳。这里在面板 vtable 上垫一层 shim 计 flush 次数与首个错误，
+ * 心跳日志一并打出；测试图案绕过 LVGL 直写帧缓冲，把"面板/背光/时序"与
+ * "LVGL 通路"一分为二。 */
+static esp_lcd_panel_handle_t s_panel;
+static esp_err_t (*s_real_draw)(esp_lcd_panel_t *, int, int, int, int, const void *);
+static volatile uint32_t s_flush_cnt, s_flush_err;
+static volatile int64_t s_pattern_until_us;   /* 图案停留期：预览/面板刷新让位 */
+
+static esp_err_t draw_shim(esp_lcd_panel_t *p, int x0, int y0, int x1, int y1, const void *d)
+{
+    s_flush_cnt++;
+    esp_err_t e = s_real_draw(p, x0, y0, x1, y1, d);
+    if (e != ESP_OK && s_flush_err++ < 3)
+        ESP_LOGE(TAG, "draw_bitmap 失败 %s (%d..%d, %d..%d)", esp_err_to_name(e), x0, x1, y0, y1);
+    return e;
+}
+
+/* 测试图案：8 竖彩条 + 中部棋盘格横带。逐行直写 RGB 帧缓冲（1.6KB 静态行缓冲，
+ * 不占 PSRAM）。返回写入失败行数。 */
+static int pattern_draw(esp_lcd_panel_handle_t panel)
+{
+    static uint16_t row[BSP_LCD_H_RES];
+    static const uint16_t bars[8] = {
+        0xffff, 0xffe0, 0x07ff, 0x07e0, 0xf81f, 0xf800, 0x001f, 0x0000
+    };   /* 白 黄 青 绿 品红 红 蓝 黑（RGB565 小端原生值） */
+    int bad = 0;
+    for (int y = 0; y < BSP_LCD_V_RES; y++) {
+        if (y >= 200 && y < 280) {
+            for (int x = 0; x < BSP_LCD_H_RES; x++)
+                row[x] = ((x / 25 + y / 25) & 1) ? 0xffff : 0x0000;
+        } else {
+            for (int x = 0; x < BSP_LCD_H_RES; x++)
+                row[x] = bars[x * 8 / BSP_LCD_H_RES];
+        }
+        if (s_real_draw(panel, 0, y, BSP_LCD_H_RES, y + 1, row) != ESP_OK) bad++;
+    }
+    return bad;
+}
+
+static void pattern_restore_cb(lv_timer_t *t)
+{
+    (void)t;
+    s_pattern_until_us = 0;
+    lv_obj_invalidate(lv_screen_active());   /* 整屏失效 → LVGL 重绘恢复 UI */
+}
+
+/* 直写测试图案并停留 hold_ms 后自动恢复 UI（HTTP 触发；不阻塞调用者） */
+void lcd_ui_test_pattern(int hold_ms)
+{
+    if (!s_panel) {
+        ESP_LOGW(TAG, "面板未初始化，测试图案不可用");
+        return;
+    }
+    if (hold_ms < 500) hold_ms = 500;
+    if (hold_ms > 15000) hold_ms = 15000;
+    s_pattern_until_us = esp_timer_get_time() + (int64_t)hold_ms * 1000;
+    int bad = pattern_draw(s_panel);
+    ESP_LOGI(TAG, "测试图案已直写面板：失败 %d 行，停留 %d ms 后恢复 UI", bad, hold_ms);
+    if (s_active && bsp_display_lock(1000)) {
+        lv_timer_t *tm = lv_timer_create(pattern_restore_cb, (uint32_t)hold_ms, NULL);
+        if (tm) lv_timer_set_repeat_count(tm, 1);
+        bsp_display_unlock();
+    } else {
+        s_pattern_until_us = 0;
+    }
+}
 
 /* ---------------- 状态行（seqlock） ---------------- */
 
@@ -397,6 +471,7 @@ static void prev_scale(uint16_t *dst, const uint16_t *src, int w, int h, int str
 /* 呈现：换 src（双缓冲交替指针必变 → LVGL 必失效重绘） */
 static bool present(int idx)
 {
+    if (esp_timer_get_time() < s_pattern_until_us) return false;  /* 图案期不覆盖 */
     if (!bsp_display_lock(500)) return false;
     lv_image_set_src(s_img, &s_dsc[idx]);
     bsp_display_unlock();
@@ -445,6 +520,10 @@ static void preview_task(void *arg)
 
         xSemaphoreTake(notify, pdMS_TO_TICKS(300));
         int64_t now = esp_timer_get_time();
+        if (now < s_pattern_until_us) {       /* 测试图案期：预览整体让位 */
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
         if (now - win_t0 >= 1000000) {    /* 1s 统计窗（无帧时也走这里归零） */
             s_prev_fps = (float)win_cnt * 1000000.0f / (float)(now - win_t0);
@@ -496,12 +575,12 @@ static lv_obj_t *mk_btn(lv_obj_t *par, int x, int y, int w, int h,
     lv_obj_set_pos(b, x, y);
     lv_obj_set_size(b, w, h);
     lv_obj_set_style_radius(b, 6, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(b, lv_color_hex(0x243044), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(b, lv_color_hex(0x36455c), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0xd6e0ea), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0xb8c8da), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(b, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(b, lv_color_hex(0x3a4a60), LV_PART_MAIN);
+    lv_obj_set_style_border_color(b, lv_color_hex(0x9db2c6), LV_PART_MAIN);
     lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
-    lv_obj_set_style_text_color(b, lv_color_hex(0xd7dee6), LV_PART_MAIN);
+    lv_obj_set_style_text_color(b, lv_color_hex(0x16222e), LV_PART_MAIN);
     lv_obj_t *l = lv_label_create(b);
     lv_label_set_text(l, txt);
     lv_obj_center(l);
@@ -514,7 +593,7 @@ static lv_obj_t *mk_cap(lv_obj_t *par, int x, int y, const char *txt)
     lv_obj_t *l = lv_label_create(par);
     lv_obj_set_pos(l, x, y);
     lv_label_set_text(l, txt);
-    lv_obj_set_style_text_color(l, lv_color_hex(0x7e8b99), 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(0x5a6b7d), 0);
     return l;
 }
 
@@ -524,7 +603,7 @@ static lv_obj_t *mk_stat(lv_obj_t *par, int x, int y, int w)
     lv_obj_set_pos(l, x, y);
     lv_obj_set_width(l, w);
     lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_color(l, lv_color_hex(0xc3ccd6), 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(0x1e2a36), 0);
     lv_label_set_text(l, "-");
     return l;
 }
@@ -535,7 +614,7 @@ static lv_obj_t *mk_val(lv_obj_t *par, int x, int y, int w)
     lv_obj_set_pos(l, x, y);
     lv_obj_set_width(l, w);
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(l, lv_color_hex(0xe8eef4), 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(0x14202c), 0);
     lv_label_set_text(l, "-");
     return l;
 }
@@ -543,9 +622,9 @@ static lv_obj_t *mk_val(lv_obj_t *par, int x, int y, int w)
 /* 选中态高亮（仅状态变化时调用，避免无谓失效） */
 static void hl(lv_obj_t *b, bool on)
 {
-    lv_obj_set_style_bg_color(b, on ? lv_color_hex(0x2f6fd0) : lv_color_hex(0x243044),
+    lv_obj_set_style_bg_color(b, on ? lv_color_hex(0x2f6fd0) : lv_color_hex(0xd6e0ea),
                               LV_PART_MAIN);
-    lv_obj_set_style_text_color(b, on ? lv_color_hex(0xffffff) : lv_color_hex(0xd7dee6),
+    lv_obj_set_style_text_color(b, on ? lv_color_hex(0xffffff) : lv_color_hex(0x16222e),
                                 LV_PART_MAIN);
 }
 
@@ -553,6 +632,15 @@ static void hl(lv_obj_t *b, bool on)
 static void panel_timer(lv_timer_t *t)
 {
     (void)t;
+    /* 心跳：每 5 s 打 flush 计数（LVGL 任务活着 = flush 在完成；
+     * esp_lvgl_port 对 RGB 面板每 flush 必回 ready，任务停摆即停打点） */
+    static int s_hb;
+    if (++s_hb >= 10) {
+        s_hb = 0;
+        ESP_LOGI(TAG, "hb: flush=%u err=%u prev=%.1f dec=%.1fms",
+                 (unsigned)s_flush_cnt, (unsigned)s_flush_err, s_prev_fps, s_dec_ms);
+    }
+    if (esp_timer_get_time() < s_pattern_until_us) return;   /* 图案期不刷新 */
     src_info_t *ci = src_if_info();
     metrics_t *m = metrics_get();
     wifi_info_t *w = wifi_net_info();
@@ -665,7 +753,7 @@ static void panel_timer(lv_timer_t *t)
     else if (strncmp(st, "Locked", 6) == 0) col = 2;
     else if (strncmp(st, "ok", 2) == 0) col = 3;
     if (col != s_st_col) {
-        static const uint32_t cols[] = { 0x8fa1b3, 0xe05c5c, 0xe0a83f, 0x4fbf72 };
+        static const uint32_t cols[] = { 0x51616f, 0xc0392b, 0xb07d18, 0x2e8b57 };
         lv_obj_set_style_text_color(l_status, lv_color_hex(cols[col]), 0);
         s_st_col = col;
     }
@@ -675,7 +763,7 @@ static void panel_timer(lv_timer_t *t)
 static void build_ui(void)
 {
     lv_obj_t *scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x10151b), 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0xf2f5f9), 0);   /* 亮底：避免"工作中的暗 UI"被读成黑屏 */
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_scrollable(scr, false);
 
@@ -696,9 +784,9 @@ static void build_ui(void)
     }
     s_nosig = lv_label_create(pv);
     lv_label_set_text(s_nosig, s_pbuf[0] ? "NO SIGNAL" : "preview off (Kconfig)");
-    lv_obj_set_style_bg_color(s_nosig, lv_color_hex(0x1a2230), 0);
+    lv_obj_set_style_bg_color(s_nosig, lv_color_hex(0xffe3e3), 0);
     lv_obj_set_style_bg_opa(s_nosig, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(s_nosig, lv_color_hex(0x9fb2c8), 0);
+    lv_obj_set_style_text_color(s_nosig, lv_color_hex(0xc0392b), 0);
     lv_obj_set_style_pad_all(s_nosig, 8, 0);
     lv_obj_set_style_radius(s_nosig, 6, 0);
     lv_obj_center(s_nosig);
@@ -720,7 +808,7 @@ static void build_ui(void)
     lv_label_set_text(title, "CamTest LCD Console");
     lv_obj_set_pos(title, RP_X + 8, 10);
     lv_obj_set_width(title, RP_W - 16);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xe8eef4), 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x14202c), 0);
 
     mk_cap(scr, RP_X + 8, 47, "Source");
     b_dvp = mk_btn(scr, 572, 40, 100, 30, "DVP", ACT_SRC_DVP);
@@ -763,18 +851,30 @@ static void build_ui(void)
     lv_obj_set_pos(l_status, RP_X + 8, 346);
     lv_obj_set_size(l_status, RP_W - 16, 74);
     lv_label_set_long_mode(l_status, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_bg_color(l_status, lv_color_hex(0x161d26), 0);
+    lv_obj_set_style_bg_color(l_status, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_bg_opa(l_status, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(l_status, 6, 0);
     lv_obj_set_style_radius(l_status, 6, 0);
-    lv_obj_set_style_text_color(l_status, lv_color_hex(0x8fa1b3), 0);
+    lv_obj_set_style_text_color(l_status, lv_color_hex(0x22303c), 0);
     lv_label_set_text(l_status, "-");
 
     lv_obj_t *hint = lv_label_create(scr);
     lv_obj_set_pos(hint, RP_X + 8, 430);
     lv_obj_set_size(hint, RP_W - 16, 44);
     lv_label_set_text(hint, "touch changes run the same path as web /api/config (NVS saved)");
-    lv_obj_set_style_text_color(hint, lv_color_hex(0x5d6a78), 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x4a5b6b), 0);
+
+    /* 醒目横幅（左下空白区）：亮屏后一眼可辨，兼作"LCD 在工作"的目验标记 */
+    lv_obj_t *banner = lv_label_create(scr);
+    lv_obj_set_pos(banner, 8, 388);
+    lv_obj_set_size(banner, PREV_W - 16, 80);
+    lv_obj_set_style_bg_color(banner, lv_color_hex(0xffd54d), 0);
+    lv_obj_set_style_bg_opa(banner, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(banner, 8, 0);
+    lv_obj_set_style_text_color(banner, lv_color_hex(0x1a1a1a), 0);
+    lv_obj_set_style_text_align(banner, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(banner, 22, 0);
+    lv_label_set_text(banner, "LCD OK · 800x480 · CamTest");
 
     lv_timer_create(panel_timer, 500, NULL);
 }
@@ -839,14 +939,70 @@ esp_err_t lcd_ui_start(void)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    lv_display_t *disp = bsp_display_start_with_config(&bcfg);
+    /* 显式走 BSP 公开 API 初始化（bsp_display_new → disp_on → lvgl_port_add_disp_rgb
+     * → bsp_touch_new → lvgl_port_add_touch），与 bsp_display_start_with_config 的
+     * 内部顺序一致，但保留面板句柄：测试图案直写 + draw_bitmap shim 都需要它 */
+    const bsp_display_config_t bdisp = { .dummy = 0 };
+    esp_lcd_panel_io_handle_t io = NULL;
+    if (bsp_display_new(&bdisp, &s_panel, &io) != ESP_OK || !s_panel) {
+        ESP_LOGE(TAG, "RGB 面板初始化失败");
+        return ESP_FAIL;
+    }
+    esp_lcd_panel_disp_on_off(s_panel, true);
+    s_real_draw = s_panel->draw_bitmap;
+    s_panel->draw_bitmap = draw_shim;
+
+    /* 开机测试图案（绕过 LVGL 直写帧缓冲）：彩条可见 = 面板时序/数据/背光全通；
+     * 仍黑 = 面板供电/背光/接线问题，与固件显示通路无关 */
+    int64_t t0 = esp_timer_get_time();
+    int bad = pattern_draw(s_panel);
+    ESP_LOGI(TAG, "开机测试图案: %d/480 行失败, 耗时 %.1f ms（停留 2s 供目验）",
+             bad, (float)(esp_timer_get_time() - t0) / 1000.0f);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    lvgl_port_cfg_t lcfg = bcfg.lvgl_port_cfg;
+    if (lvgl_port_init(&lcfg) != ESP_OK) {
+        ESP_LOGE(TAG, "lvgl_port_init 失败");
+        return ESP_FAIL;
+    }
+    lvgl_port_display_cfg_t disp_cfg = {
+        .io_handle = io,
+        .panel_handle = s_panel,
+        .buffer_size = bcfg.buffer_size,
+        .double_buffer = bcfg.double_buffer,
+        .hres = BSP_LCD_H_RES,
+        .vres = BSP_LCD_V_RES,
+        .monochrome = false,
+        .rotation = { .swap_xy = false, .mirror_x = false, .mirror_y = false },
+        .flags = {
+            .buff_dma = bcfg.flags.buff_dma,
+            .buff_spiram = bcfg.flags.buff_spiram,
+            .swap_bytes = (BSP_LCD_BIGENDIAN ? true : false),
+            .sw_rotate = bcfg.flags.sw_rotate,
+        },
+    };
+    const lvgl_port_display_rgb_cfg_t rgb_cfg = {
+        .flags = { .bb_mode = 0, .avoid_tearing = false },
+    };
+    lv_display_t *disp = lvgl_port_add_disp_rgb(&disp_cfg, &rgb_cfg);
     if (!disp) {
-        ESP_LOGE(TAG, "BSP 显示初始化失败");
+        ESP_LOGE(TAG, "LVGL 显示注册失败");
         return ESP_FAIL;
     }
 
+    esp_lcd_touch_handle_t tp = NULL;
+    if (bsp_touch_new(NULL, &tp) != ESP_OK || !tp) {
+        ESP_LOGE(TAG, "触摸初始化失败");
+        return ESP_FAIL;
+    }
+    const lvgl_port_touch_cfg_t tcfg = { .disp = disp, .handle = tp };
+    if (!lvgl_port_add_touch(&tcfg)) ESP_LOGW(TAG, "触摸输入注册失败（仅显示）");
+
     s_active = true;
-    bsp_display_lock(0);
+    if (!bsp_display_lock(1000)) {
+        ESP_LOGE(TAG, "LVGL 锁超时，UI 未构建");
+        return ESP_FAIL;
+    }
     build_ui();
     bsp_display_unlock();
 
@@ -883,6 +1039,8 @@ lcd_ui_stats_t lcd_ui_stats(void)
         .preview_on = s_preview_on,
         .preview_fps = s_prev_fps,
         .dec_ms = s_dec_ms,
+        .flush_cnt = s_flush_cnt,
+        .flush_err = s_flush_err,
     };
     return s;
 }
@@ -892,6 +1050,7 @@ bool lcd_ui_active(void) { return s_active; }
 #else  /* !CONFIG_CAMTEST_ENABLE_LCD */
 
 esp_err_t lcd_ui_start(void) { return ESP_ERR_NOT_SUPPORTED; }
+void lcd_ui_test_pattern(int hold_ms) { (void)hold_ms; }
 
 lcd_ui_stats_t lcd_ui_stats(void)
 {
