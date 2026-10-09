@@ -59,11 +59,25 @@ static const char *TAG = "src_usb";
 
 #define USB_DEV_ANY          0
 #define FRAME_BUFFERS        4      /* uvc 驱动帧缓冲数（按协商 dwMaxVideoFrameSize 自分配 PSRAM；4 个平滑 60fps 突发） */
-#define NUM_URBS             8      /* ISOC 在途 URB 数：数量掉到 4 时仅 1.5ms 微帧覆盖即丢包
-                                         * （FID 错→整帧弃）。在途覆盖 =（URB数−1）×每URB微帧数×125µs */
-#define URB_SIZE             9216   /* 3×3072B MPS 微帧：覆盖（8−1）×3×125µs=2.625ms，高于 1.5ms
-                                         * 失败点 75%；且 8×9216=72KB 比 8×12288=96KB 省 24.6KB
-                                         * 内部 DMA——LCD 面板链表/任务栈与 UVC 在途缓冲共存的预算关键 */
+/* URB 在途配置降档链：真机 2026-10-09 DVP→USB 切换 NO_MEM 根因——LCD/WiFi 运行后
+ * 内部 DMA 总空闲从开机 131KB 降到 ~56KB（最大块 31.7KB），72KB 总量的 8×9216 凑不齐，
+ * uvc_transfers_allocate 报 NO_MEM 被迫回滚（开机首开正常、运行期重开必失败；
+ * urb_alloc 每 URB 是一块独立 heap_caps_malloc(DMA|INTERNAL)，受总空闲和最大块双重约束）。
+ * urb_size 会被驱动 usb_round_up_to_mps 向上取整到 MPS 整数倍（本机 MPS=3072），
+ * 档位直接取 3072 倍数避免取整膨胀（如 4608 会被抬成 6144 反而多占）。
+ * 在途覆盖 =（URB数−1）×每URB微帧数×125µs，须高于 1.5ms 失败点（4×9216 时仅
+ * 1.5ms 即丢包，FID 错→整帧弃）。档 1/2 与档 0 同为 72KB 总量、只缩单块尺寸
+ * （对纯碎片化场景兜底），档 3 缩总量到 48KB（对总空闲不足——真机实际命中的档）。
+ * 每 URB 越小 resubmit 频率越高，但 60fps 实测每帧 ~10 个完成中断，负担可忽略 */
+typedef struct { uint16_t size; uint8_t n; } urb_cfg_t;
+static const urb_cfg_t URB_TIERS[] = {
+    { 9216, 8 },    /* 3 微帧/URB：覆盖（8−1）×3×125µs=2.625ms，比 8×12288 省 24.6KB 内部 DMA
+                         * ——LCD 面板链表/任务栈与 UVC 在途缓冲共存的预算关键（原单档） */
+    { 6144, 12 },   /* 2 微帧/URB：覆盖（12−1）×2×125µs=2.75ms */
+    { 3072, 24 },   /* 1 微帧/URB：覆盖（24−1)×1×125µs=2.875ms */
+    { 3072, 16 },   /* 末档兜底：总量 48KB，覆盖 1.875ms（仍高于 1.5ms 失败点） */
+};
+#define URB_TIER_CNT   ((int)(sizeof(URB_TIERS) / sizeof(URB_TIERS[0])))
 #define WORK_QUEUE_LEN       4      /* 与 FRAME_BUFFERS 对齐（深于驱动缓冲数无意义） */
 #define STREAM_OPEN_TIMEOUT_MS 5000
 #define RETRY_BACKOFF_MS     1000   /* ERROR 态重试间隔（供电不足场景别疯狂重试） */
@@ -775,13 +789,42 @@ static esp_err_t try_open_stream_on_index(uint8_t stream_idx)
             .number_of_frame_buffers = FRAME_BUFFERS,
             .frame_size = 0,        /* 0 = 用协商出的 dwMaxVideoFrameSize */
             .frame_heap_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-            .number_of_urbs = NUM_URBS,
-            .urb_size = URB_SIZE,
+            .number_of_urbs = URB_TIERS[0].n,
+            .urb_size = URB_TIERS[0].size,
             .user_frame_buffers = NULL,   /* 驱动自分配（重编码的大帧也放得下） */
         },
     };
     uvc_host_stream_hdl_t h = NULL;
-    esp_err_t err = uvc_host_stream_open(&cfg, pdMS_TO_TICKS(STREAM_OPEN_TIMEOUT_MS), &h);
+    esp_err_t err = ESP_ERR_NO_MEM;
+    /* 按当前堆状态预选起始档：跳过总量/单块注定放不下的高档（避免每次都从 8×9216
+     * 交 3 次注定失败的尝试、刷 3 条误导性 NO_MEM ERROR）；预选不准时 NO_MEM 链兜底 */
+    size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    int t_start = 0;
+    while (t_start < URB_TIER_CNT - 1 &&
+           ((size_t)URB_TIERS[t_start].n * URB_TIERS[t_start].size > dma_free ||
+            URB_TIERS[t_start].size > dma_largest)) {
+        t_start++;
+    }
+    if (t_start > 0)
+        ESP_LOGW(TAG, "内部 DMA 空闲 %u 最大块 %u：URB 首选 %d×%uB（高档预留不足）",
+                 (unsigned)dma_free, (unsigned)dma_largest, URB_TIERS[t_start].n, URB_TIERS[t_start].size);
+    for (int t = t_start; t < URB_TIER_CNT; t++) {
+        cfg.advanced.number_of_urbs = URB_TIERS[t].n;
+        cfg.advanced.urb_size = URB_TIERS[t].size;
+        err = uvc_host_stream_open(&cfg, pdMS_TO_TICKS(STREAM_OPEN_TIMEOUT_MS), &h);
+        if (err == ESP_OK) {
+            if (t != t_start) ESP_LOGW(TAG, "URB 降档 %d×%uB 开流成功（前档 %d×%uB 分配失败）",
+                                       URB_TIERS[t].n, URB_TIERS[t].size,
+                                       URB_TIERS[t - 1].n, URB_TIERS[t - 1].size);
+            break;
+        }
+        if (err != ESP_ERR_NO_MEM) break;   /* 非内存失败（协商/超时）换档无意义 */
+        ESP_LOGW(TAG, "stream_open NO_MEM（URB %d×%uB）：内部 DMA 空闲 %u 最大块 %u，降档重试",
+                 URB_TIERS[t].n, URB_TIERS[t].size,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    }
     ESP_RETURN_ON_ERROR(err, TAG, "stream_open (%s %ux%u)", fmt_enum_name(fi->format), fi->h_res, fi->v_res);
     s_u.stream = h;
 
