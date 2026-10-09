@@ -169,7 +169,7 @@ static esp_err_t h_status(httpd_req_t *req)
         "\"stack\":[%d,%d],"
         "\"uptime_s\":%u,\"rst_reason\":%d,"
         "\"overlay\":%s,\"target_mbps\":%.1f,\"gov_last\":\"%s\",\"hifps\":%d,"
-        "\"tcp_nodelay\":1,\"lcd_on\":%d,\"lcd_prev_fps\":%.1f,\"lcd_dec_ms\":%.1f,"
+        "\"tcp_nodelay\":1,\"lcd_on\":%d,\"lcd_pv\":%d,\"lcd_prev_fps\":%.1f,\"lcd_dec_ms\":%.1f,"
         "\"lcd_flush\":%u,\"lcd_flush_err\":%u,"
         "\"wifi\":{\"mode\":\"%s\",\"phy\":\"%s\",\"channel\":%d,\"band_mhz\":%d,\"rssi\":%d,\"ssid\":\"%s\"},"
         "\"ip\":\"%s\",\"mdns\":\"%s.local\","
@@ -188,7 +188,7 @@ static esp_err_t h_status(httpd_req_t *req)
         (unsigned)m->drop_capture, (unsigned)m->drop_encode,
         m->stack_cap, m->stack_enc, (unsigned)m->uptime_s, esp_reset_reason(),
         src_if_overlay() ? "true" : "false", m->target_mbps, m->gov_last, cam_boost_level(),
-        lcd.active ? 1 : 0, lcd.preview_fps, lcd.dec_ms,
+        lcd.active ? 1 : 0, lcd.pv_on ? 1 : 0, lcd.preview_fps, lcd.dec_ms,
         (unsigned)lcd.flush_cnt, (unsigned)lcd.flush_err,
         w->mode == WIFI_MODE_STA_M ? "STA" : "AP", w->phy, w->channel, w->band_mhz,
         w->rssi, w->ssid, w->ip, CONFIG_CAMTEST_MDNS_HOSTNAME, clients,
@@ -419,6 +419,25 @@ static esp_err_t h_lcdtest(httpd_req_t *req)
                            HTTPD_RESP_USE_STRLEN);
 }
 
+/* ---------------- /api/lcdpv（预览开关：与屏上 PV 按钮同一状态） ---------------- */
+static esp_err_t h_lcdpv(httpd_req_t *req)
+{
+    char q[64] = {0};
+    char v[16] = {0};
+    bool on = !lcd_ui_stats().pv_on;   /* 无参 = 翻转 */
+    if (httpd_req_get_url_query_str(req, q, sizeof(q) - 1) == ESP_OK &&
+        httpd_query_key_value(q, "on", v, sizeof(v) - 1) == ESP_OK) {
+        on = atoi(v) != 0;
+    }
+    lcd_ui_pv_set(on);
+    lcd_ui_stats_t s = lcd_ui_stats();
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"lcd_pv\":%d,\"lcd_prev_fps\":%.1f}",
+             s.pv_on ? 1 : 0, s.preview_fps);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+}
+
 /* ---------------- 注册 ---------------- */
 static const httpd_uri_t s_uris[] = {
     { .uri = "/",                .method = HTTP_GET,  .handler = h_index },
@@ -426,6 +445,7 @@ static const httpd_uri_t s_uris[] = {
     { .uri = "/api/sync",        .method = HTTP_GET,  .handler = h_sync },
     { .uri = "/api/status",      .method = HTTP_GET,  .handler = h_status },
     { .uri = "/api/lcdtest",     .method = HTTP_GET,  .handler = h_lcdtest },
+    { .uri = "/api/lcdpv",       .method = HTTP_GET,  .handler = h_lcdpv },
     { .uri = "/api/config",      .method = HTTP_POST, .handler = h_config },
     { .uri = "/api/scan/start",  .method = HTTP_GET,  .handler = h_scan_start },
     { .uri = "/api/scan/stop",   .method = HTTP_GET,  .handler = h_scan_stop },

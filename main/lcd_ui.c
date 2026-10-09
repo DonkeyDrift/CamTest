@@ -78,6 +78,7 @@ static const char *TAG = "lcd_ui";
 /* ---------------- 全局状态 ---------------- */
 static volatile bool s_active;
 static volatile bool s_preview_on;              /* 预览任务在跑 */
+static volatile bool s_pv_on = true;            /* 屏上 PV 开关（关=任务深睡省 CPU，不落 NVS） */
 
 /* 预览双缓冲（PSRAM）+ 硬解输出缓冲 */
 static uint16_t *s_pbuf[2];
@@ -101,16 +102,19 @@ static portMUX_TYPE s_st_mux = portMUX_INITIALIZER_UNLOCKED;
 typedef struct { char json[176]; } cfg_msg_t;
 static QueueHandle_t s_cfgq;
 
+/* 预览唤醒信号量：帧环发布 + PV 按钮唤醒共用（预览关时任务深睡等它） */
+static SemaphoreHandle_t s_pv_notify;
+
 /* LVGL 控件（build_ui 创建；panel_timer 更新；均活在 LVGL 任务里） */
 static lv_obj_t *s_img, *s_nosig;
 static lv_obj_t *l_fps, *l_rate, *l_cpu, *l_heap, *l_psram;
 static lv_obj_t *l_src, *l_wifi, *l_ip, *l_lcd, *l_scan;
-static lv_obj_t *b_dvp, *b_usb, *b_pt, *b_re, *b_ov, *b_ov_lab;
+static lv_obj_t *b_dvp, *b_usb, *b_pt, *b_re, *b_ov, *b_ov_lab, *b_pv, *b_pv_lab;
 static lv_obj_t *v_res, *v_q, *v_fps, *v_hp, *v_mb;
 static lv_obj_t *w_usb[3], *w_dvp[4];           /* 条件显隐的两组行 */
 static lv_obj_t *l_status;
 static bool s_nosig_shown = true;
-static int s_prev_src = -1, s_prev_um = -1, s_prev_ov = -1, s_prev_vis = -1, s_st_col = -1;
+static int s_prev_src = -1, s_prev_um = -1, s_prev_ov = -1, s_prev_pv = -1, s_prev_vis = -1, s_st_col = -1;
 
 /* ---------------- 面板直通 + flush 观测 + 测试图案 ----------------
  * esp_lvgl_port 的 flush 忽略 draw_bitmap 返回值：写帧缓冲失败会"静默黑屏"、
@@ -237,6 +241,7 @@ typedef enum {
     ACT_FPS_DEC, ACT_FPS_INC,
     ACT_HP_DEC, ACT_HP_INC,
     ACT_OV_TOGGLE,
+    ACT_PV_TOGGLE,
     ACT_MB_DEC, ACT_MB_INC,
 } act_t;
 
@@ -372,6 +377,13 @@ static void act_event(lv_event_t *e)
         else        snprintf(json, sizeof(json), "{\"target_mbps\":%d.0}", n);
         break;
     }
+    case ACT_PV_TOGGLE:
+        /* LCD 本地开关（不动流水线，与 Tab5 同设计）：关=预览任务注销帧环
+         * 深度休眠——解码/缩放/翻页全停，CPU 让给主链。S31 预览消费主 MJPEG
+         * 帧环，无附产流门控，故不调 src_if_pv_*（该 API 为 Tab5 专有） */
+        lcd_ui_pv_set(!s_pv_on);
+        if (s_preview_on) setl(s_nosig, s_pv_on ? "NO SIGNAL" : "preview off");
+        return;
     default:
         return;
     }
@@ -501,7 +513,7 @@ static void preview_task(void *arg)
         .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
     };
 
-    SemaphoreHandle_t notify = xSemaphoreCreateBinary();
+    SemaphoreHandle_t notify = s_pv_notify;   /* 与 PV 按钮共用（lcd_ui_start 创建） */
     frame_ring_t *reg = NULL;             /* 当前已注册的环（源切换会换环） */
     uint32_t last_fid = 0;
     float ema_ms = 0;
@@ -509,6 +521,14 @@ static void preview_task(void *arg)
     int win_cnt = 0;
 
     for (;;) {
+        if (!s_pv_on) {
+            /* 预览关（屏上按钮）：注销帧环订阅、深睡等唤醒——解码/缩放/
+             * 翻页全部停止，CPU 与内存带宽让给主链 */
+            if (reg) { frame_ring_unregister(reg, notify); reg = NULL; }
+            s_prev_fps = 0;
+            xSemaphoreTake(notify, portMAX_DELAY);
+            continue;
+        }
         /* 源切换（DVP↔USB）可能更换帧环：换环重注册、帧号重置 */
         frame_ring_t *cur = src_if_ring();
         if (cur && cur != reg) {
@@ -681,7 +701,8 @@ static void panel_timer(lv_timer_t *t)
     setl(l_ip, buf);
 
     if (s_preview_on) {
-        snprintf(buf, sizeof(buf), "LCD  %.1f fps  %.1f ms", s_prev_fps, s_dec_ms);
+        if (s_pv_on) snprintf(buf, sizeof(buf), "LCD  %.1f fps  %.1f ms", s_prev_fps, s_dec_ms);
+        else         snprintf(buf, sizeof(buf), "LCD  preview off (saved CPU)");
     } else {
         snprintf(buf, sizeof(buf), "LCD  no preview (fps=0)");
     }
@@ -725,6 +746,12 @@ static void panel_timer(lv_timer_t *t)
     }
     int st_ov = src_if_overlay() ? 1 : 0;
     if (st_ov != s_prev_ov) { hl(b_ov, st_ov != 0); s_prev_ov = st_ov; }
+    int st_pv = s_pv_on ? 1 : 0;
+    if (st_pv != s_prev_pv) {
+        hl(b_pv, st_pv != 0);
+        setl(b_pv_lab, st_pv ? "PV ON" : "PV OFF");
+        s_prev_pv = st_pv;
+    }
     int st_vis = usb ? 1 : 0;
     if (st_vis != s_prev_vis) {
         for (int i = 0; i < 3; i++)
@@ -734,10 +761,12 @@ static void panel_timer(lv_timer_t *t)
         s_prev_vis = st_vis;
     }
 
-    /* 无帧 >3s 重新亮 NO SIGNAL（预览缓冲存在时） */
+    /* 无帧 >3s 重新亮 NO SIGNAL（预览缓冲存在时）；PV 关时常显提示 */
     if (s_pbuf[0]) {
+        setl(s_nosig, s_pv_on ? "NO SIGNAL" : "preview off");
         uint32_t now32 = (uint32_t)esp_timer_get_time();
-        bool show = (s_last_frame_us == 0) || (uint32_t)(now32 - s_last_frame_us) > 3000000u;
+        bool show = !s_pv_on || (s_last_frame_us == 0) ||
+                    (uint32_t)(now32 - s_last_frame_us) > 3000000u;
         if (show != s_nosig_shown) {
             lv_obj_set_hidden(s_nosig, !show);
             s_nosig_shown = show;
@@ -841,6 +870,9 @@ static void build_ui(void)
     mk_cap(scr, RP_X + 8, 275, "Overlay");
     b_ov = mk_btn(scr, 572, 268, 100, 30, "OFF", ACT_OV_TOGGLE);
     b_ov_lab = lv_obj_get_child(b_ov, 0);
+    /* 预览开关（Tab5 同设计）：Overlay 行右侧空位，文字自描述 PV ON/OFF */
+    b_pv = mk_btn(scr, 676, 268, 100, 30, "PV ON", ACT_PV_TOGGLE);
+    b_pv_lab = lv_obj_get_child(b_pv, 0);
 
     mk_cap(scr, RP_X + 8, 313, "Mbps");
     mk_btn(scr, 572, 306, 32, 30, "<", ACT_MB_DEC);
@@ -1010,7 +1042,8 @@ esp_err_t lcd_ui_start(void)
         ESP_LOGE(TAG, "配置任务创建失败");
         return ESP_ERR_NO_MEM;
     }
-    if (s_pbuf[0] && CONFIG_CAMTEST_LCD_PREVIEW_FPS > 0) {
+    s_pv_notify = xSemaphoreCreateBinary();
+    if (s_pbuf[0] && s_pv_notify && CONFIG_CAMTEST_LCD_PREVIEW_FPS > 0) {
         if (xTaskCreatePinnedToCore(preview_task, "lcd_prev", 6144, NULL, 2, NULL, 1)
             == pdPASS) {
             s_preview_on = true;
@@ -1037,6 +1070,7 @@ lcd_ui_stats_t lcd_ui_stats(void)
     lcd_ui_stats_t s = {
         .active = s_active,
         .preview_on = s_preview_on,
+        .pv_on = s_pv_on,
         .preview_fps = s_prev_fps,
         .dec_ms = s_dec_ms,
         .flush_cnt = s_flush_cnt,
@@ -1045,12 +1079,24 @@ lcd_ui_stats_t lcd_ui_stats(void)
     return s;
 }
 
+void lcd_ui_pv_set(bool on)
+{
+    if (!s_preview_on) {
+        status_set("preview task n/a");
+        return;
+    }
+    s_pv_on = on;
+    if (on && s_pv_notify) xSemaphoreGive(s_pv_notify);
+    status_set(on ? "preview on" : "preview off: CPU -> main");
+}
+
 bool lcd_ui_active(void) { return s_active; }
 
 #else  /* !CONFIG_CAMTEST_ENABLE_LCD */
 
 esp_err_t lcd_ui_start(void) { return ESP_ERR_NOT_SUPPORTED; }
 void lcd_ui_test_pattern(int hold_ms) { (void)hold_ms; }
+void lcd_ui_pv_set(bool on) { (void)on; }
 
 lcd_ui_stats_t lcd_ui_stats(void)
 {
