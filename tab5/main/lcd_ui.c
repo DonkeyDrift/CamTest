@@ -5,7 +5,9 @@
  * 与 S31 版的架构等价（低开销纪律全部保留）：
  *  - 预览 = frame_ring 订阅者（只取最新帧、超速丢弃不排队）；
  *  - 解码经 jpeg_dec_share（P4 解码器单例，与 source_usb 互斥共享）；
- *  - 解码输出 RGB565 直供 LVGL image（无二次转换）；
+ *  - 解码 RGB565 等比放大填满预览区后直写 DSI 后备帧缓冲，
+ *    draw_bitmap(fb 指针) 触发驱动帧边界翻页（无撕裂，见 esp_lcd_panel_dpi.c）；
+ *  - LVGL 只画状态/触控面板，局部刷新经 draw_shim 镜像同步两页 fb；
  *  - LVGL 渲染任务钉 core0（采集/编码/worker 都在 core1）；
  *  - 触屏动作 → 队列 → apply_task 走 app_config_apply（与网页同路径）。
  *
@@ -33,6 +35,7 @@
 #include "esp_timer.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_cache.h"
 #include "esp_ldo_regulator.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
@@ -96,9 +99,11 @@ static volatile bool s_active;
 static volatile bool s_preview_on;
 static board_version_t s_board_ver = BOARD_V_UNKNOWN;
 
-static uint16_t *s_pbuf[2];
-static lv_image_dsc_t s_dsc[2];
-static int s_back;
+/* DSI 双帧缓冲（驱动分配，PSRAM 黑底）：预览写后备页，draw_bitmap(fb 指针)
+ * 让驱动在帧完成边界翻页——消除"中间斜线"撕裂（写速率≈扫描速率所致） */
+static uint16_t *s_fb[2];
+static size_t s_fb_px;           /* 每页像素数 = 720*1280 */
+static int s_cur;                /* 正在扫描输出的页序号（自跟踪：仅预览翻页会改） */
 
 static volatile float s_prev_fps;
 static volatile float s_dec_ms;
@@ -129,12 +134,40 @@ static esp_lcd_panel_handle_t s_panel;
 static esp_err_t (*s_real_draw)(esp_lcd_panel_t *, int, int, int, int, const void *);
 static volatile uint32_t s_flush_cnt, s_flush_err;
 
+static inline bool ptr_in_fb(const void *p)
+{
+    for (int i = 0; i < 2; i++)
+        if (s_fb[i] && (const uint16_t *)p >= s_fb[i] &&
+            (const uint16_t *)p < s_fb[i] + s_fb_px) return true;
+    return false;
+}
+
+/* LVGL 局部刷新经驱动 CPU 拷贝只落在当前显示页——把同一区域镜像到另一页，
+ * 否则翻页后 UI 改动"消失"一帧。x1/y1 排他（与 DPI 驱动坐标语义一致） */
+static void mirror_region(int x0, int y0, int x1, int y1)
+{
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > LCD_H_RES) x1 = LCD_H_RES;
+    if (y1 > LCD_V_RES) y1 = LCD_V_RES;
+    if (x1 <= x0 || y1 <= y0) return;
+    uint16_t *from = s_fb[s_cur], *to = s_fb[s_cur ^ 1];
+    for (int y = y0; y < y1; y++)
+        memcpy(to + (size_t)y * LCD_H_RES + x0,
+               from + (size_t)y * LCD_H_RES + x0, (size_t)(x1 - x0) * 2);
+    esp_cache_msync(to + (size_t)y0 * LCD_H_RES + x0, (size_t)(y1 - y0) * LCD_H_RES * 2,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+}
+
 static esp_err_t draw_shim(esp_lcd_panel_t *p, int x0, int y0, int x1, int y1, const void *d)
 {
     s_flush_cnt++;
     esp_err_t e = s_real_draw(p, x0, y0, x1, y1, d);
-    if (e != ESP_OK && s_flush_err++ < 3)
+    if (e == ESP_OK) {
+        if (s_fb[0] && !ptr_in_fb(d)) mirror_region(x0, y0, x1, y1);
+    } else if (s_flush_err++ < 3) {
         ESP_LOGE(TAG, "draw_bitmap 失败 %s (%d..%d, %d..%d)", esp_err_to_name(e), x0, x1, y0, y1);
+    }
     return e;
 }
 
@@ -381,13 +414,26 @@ static uint32_t dec_stride(uint32_t w, uint32_t h, uint32_t out_size)
     return w;
 }
 
-/* 等比 letterbox 最近邻：src[w*h，行距 stride] → dst[PREV_W*PREV_H] */
-static void prev_scale(uint16_t *dst, const uint16_t *src, int w, int h, int stride)
+/* 等比放大填满预览区（最近邻）：src[w*h，行距 stride] → fb 预览区 720x540。
+ * 档位变化时清一次两页预览区（含黑边），黑边此后无人写、保持常黑 */
+static int s_geo_w = -1, s_geo_h = -1;
+
+static void prev_fill(uint16_t *dst, const uint16_t *src, int w, int h, int stride)
 {
     if (w < 1 || h < 1) return;
+    if (w != s_geo_w || h != s_geo_h) {
+        for (int f = 0; f < 2; f++) {
+            if (!s_fb[f]) continue;
+            memset(s_fb[f], 0, (size_t)PREV_W * PREV_H * 2);
+            esp_cache_msync(s_fb[f], (size_t)PREV_W * PREV_H * 2,
+                            ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+        }
+        s_geo_w = w;
+        s_geo_h = h;
+    }
     int dw, dh;
     if ((int64_t)w * PREV_H > (int64_t)h * PREV_W) { dw = PREV_W; dh = (int)((int64_t)h * PREV_W / w); }
-    else                                            { dh = PREV_H; dw = (int)((int64_t)w * PREV_H / h); }
+    else                                           { dh = PREV_H; dw = (int)((int64_t)w * PREV_H / h); }
     if (dw < 1) dw = 1;
     if (dh < 1) dh = 1;
     int ox = (PREV_W - dw) / 2, oy = (PREV_H - dh) / 2;
@@ -395,33 +441,23 @@ static void prev_scale(uint16_t *dst, const uint16_t *src, int w, int h, int str
     static int16_t mapy[PREV_H];
     for (int x = 0; x < dw; x++) mapx[x] = (uint16_t)((int64_t)x * w / dw);
     for (int y = 0; y < dh; y++) mapy[y] = (int16_t)((int64_t)y * h / dh);
-    memset(dst, 0, (size_t)PREV_W * PREV_H * 2);
     for (int y = 0; y < dh; y++) {
         const uint16_t *srow = src + (size_t)mapy[y] * stride;
-        uint16_t *drow = dst + (size_t)(oy + y) * PREV_W + ox;
+        uint16_t *drow = dst + (size_t)(oy + y) * LCD_H_RES + ox;
         for (int x = 0; x < dw; x++) drow[x] = srow[mapx[x]];
     }
 }
 
-/* 呈现：直写 DSI 帧缓冲（不走 LVGL），不缩放、源帧 letterbox 居中贴图。
- * ★ 两层优化（实测从 1-2 fps 提到限速档）：
- *   1. 绕过 LVGL：esp_lvgl_port 渲染+DSI flush 期间持锁，set_src 抢锁上百 ms；
- *   2. 零软件缩放：MJPEG 全档分辨率均为 MCU(16) 倍数 → 解码行距==宽，
- *      draw_bitmap 直接吃解码输出（600KB 拷一次），省掉 777KB×2 的
- *      prev_scale+双缓冲 PSRAM 流量（PSRAM 带宽是预览的真瓶颈）。
- *      行距异常（非 MCU 帧宽）时回退软件缩放路径。 */
-static bool present_direct(const uint16_t *src, int w, int h)
+/* 翻页呈现：后备页写好后以"页指针"为源调 draw_bitmap——驱动识别为帧缓冲
+ * 驻留，只做 cache 回写并切换 cur_fb_index，DMA 在下一次帧完成边界自动
+ * 换链表（esp_lcd_panel_dpi.c draw_bitmap_2d no-copy 分支），全程无撕裂 */
+static bool present_flip(void)
 {
-    if (!s_panel || !s_real_draw) return false;
-    int ox = (PREV_W - w) / 2, oy = (PREV_H - h) / 2;
-    if (ox < 0 || oy < 0) return false;   /* 源大于预览区（不会发生：档位≤720） */
-    return s_real_draw(s_panel, ox, oy, ox + w - 1, oy + h - 1, src) == ESP_OK;
-}
-
-static bool present(int idx)
-{
-    if (!s_panel || !s_real_draw) return false;
-    return s_real_draw(s_panel, 0, 0, PREV_W - 1, PREV_H - 1, s_pbuf[idx]) == ESP_OK;
+    if (!s_panel || !s_real_draw || !s_fb[0]) return false;
+    uint16_t *back = s_fb[s_cur ^ 1];
+    if (s_real_draw(s_panel, 0, 0, LCD_H_RES, PREV_H, back) != ESP_OK) return false;
+    s_cur ^= 1;
+    return true;
 }
 
 static void preview_task(void *arg)
@@ -462,14 +498,16 @@ static void preview_task(void *arg)
         }
         if (period && now < next_ok) continue;
 
+        bool got_pv = false;
         if (reg) {
-            /* 双流取帧：h264 模式帧环交替发布 H264+JPEG——只有 JPEG 能解。
-             * h264 帧"消费掉 last_fid"会让下次 acquire 又拿到 h264（一半概率
-             * 空转）；改为不推进 last_fid、最多连取 3 帧找 JPEG */
-            for (int tries = 0; tries < 3; tries++) {
+            /* 双流取帧：h264 模式帧环只保留最新帧——若最新恰是 H264，它前面的
+             * JPEG 已被顶掉，本轮注定落空（连取 3 次也只会 NULL）。落空时
+             * 20ms 后快速重查贴住 pv 发布节奏，取到 JPEG 才回限速周期 */
+            for (int tries = 0; tries < 3 && !got_pv; tries++) {
                 frame_slot_t *s = frame_ring_acquire(reg, last_fid);
                 if (!s) break;
                 if (s->codec == FRAME_CODEC_JPEG) {
+                    got_pv = true;
                     jpeg_decode_picture_info_t info;
                     if (jpeg_decoder_get_info(s->data, (uint32_t)s->len, &info) == ESP_OK &&
                         info.width && info.height) {
@@ -484,20 +522,9 @@ static void preview_task(void *arg)
                                 ema_ms += 0.15f * (ms - ema_ms);
                                 s_dec_ms = ema_ms;
                                 uint32_t stride = dec_stride(info.width, info.height, out_size);
-                                bool ok;
-                                if (stride == info.width &&
-                                    info.width <= PREV_W && info.height <= PREV_H) {
-                                    /* 快路径：解码输出直贴（零缩放零中转） */
-                                    ok = present_direct((const uint16_t *)s_out,
-                                                        (int)info.width, (int)info.height);
-                                } else {
-                                    int b = s_back;
-                                    prev_scale(s_pbuf[b], (const uint16_t *)s_out,
-                                               (int)info.width, (int)info.height, (int)stride);
-                                    ok = present(b);
-                                    if (ok) s_back = b ^ 1;
-                                }
-                                if (!ok) { /* draw 失败：下一帧覆盖即可 */ }
+                                prev_fill(s_fb[s_cur ^ 1], (const uint16_t *)s_out,
+                                          (int)info.width, (int)info.height, (int)stride);
+                                present_flip();
                                 s_last_frame_us = (uint32_t)esp_timer_get_time();
                                 win_cnt++;
                             }
@@ -511,7 +538,7 @@ static void preview_task(void *arg)
                 last_fid = s->fid;   /* h264 帧也推进：否则下轮 acquire 重取同帧空转 */
             }
         }
-        next_ok = now + period;
+        next_ok = now + (got_pv || !period ? period : 20000);
     }
 }
 
@@ -653,7 +680,7 @@ static void panel_timer(lv_timer_t *t)
     int st_ov = src_if_overlay() ? 1 : 0;
     if (st_ov != s_prev_ov) { hl(b_ov, st_ov != 0); s_prev_ov = st_ov; }
 
-    if (s_pbuf[0]) {
+    if (s_fb[0]) {
         uint32_t now32 = (uint32_t)esp_timer_get_time();
         bool show = (s_last_frame_us == 0) || (uint32_t)(now32 - s_last_frame_us) > 3000000u;
         if (show != s_nosig_shown) {
@@ -695,7 +722,7 @@ static void build_ui(void)
     lv_obj_set_scrollable(pv, false);
     /* 预览画面不走 LVGL（present 直写 DSI 帧缓冲）——这里只留黑底容器 */
     s_nosig = lv_label_create(pv);
-    lv_label_set_text(s_nosig, s_pbuf[0] ? "NO SIGNAL" : "preview off (Kconfig)");
+    lv_label_set_text(s_nosig, s_fb[0] ? "NO SIGNAL" : "preview off (Kconfig)");
     lv_obj_set_style_bg_color(s_nosig, lv_color_hex(0xffe3e3), 0);
     lv_obj_set_style_bg_opa(s_nosig, LV_OPA_COVER, 0);
     lv_obj_set_style_text_color(s_nosig, lv_color_hex(0xc0392b), 0);
@@ -886,25 +913,26 @@ static esp_err_t panel_init(esp_lcd_panel_handle_t *out_panel, esp_lcd_panel_io_
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_dbi(bus, &dbi, &io), TAG, "dbi io");
 
     /* 三套 DSI 时序（esp-bsp 同源） */
-    /* num_fbs=1：DSI 帧缓冲 1.8MB/帧（PSRAM）——省 1.8MB 并减少内部描述符；
-     * LVGL 自带双 draw buffer，单 DSI fb 足够（ tear 由 LVGL 部分刷新节奏掩盖） */
+    /* num_fbs=2：预览直写后备页，draw_bitmap(fb 指针) 在帧完成边界翻页
+     * （无撕裂）。LVGL 局部刷新经 draw_shim 镜像同步两页 UI 区域。
+     * 每页 1.8MB PSRAM（共 3.6MB），换掉撕裂的"写扫描中缓冲"路径 */
     const esp_lcd_dpi_panel_config_t dpi_ili9881c = {
         .virtual_channel = 0, .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
-        .dpi_clock_freq_mhz = 60, .in_color_format = LCD_COLOR_FMT_RGB565, .num_fbs = 1,
+        .dpi_clock_freq_mhz = 60, .in_color_format = LCD_COLOR_FMT_RGB565, .num_fbs = 2,
         .video_timing = { .h_size = LCD_H_RES, .v_size = LCD_V_RES,
                           .hsync_back_porch = 140, .hsync_pulse_width = 40, .hsync_front_porch = 40,
                           .vsync_back_porch = 20, .vsync_pulse_width = 4, .vsync_front_porch = 20 },
     };
     const esp_lcd_dpi_panel_config_t dpi_st7123 = {
         .virtual_channel = 0, .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
-        .dpi_clock_freq_mhz = 70, .in_color_format = LCD_COLOR_FMT_RGB565, .num_fbs = 1,
+        .dpi_clock_freq_mhz = 70, .in_color_format = LCD_COLOR_FMT_RGB565, .num_fbs = 2,
         .video_timing = { .h_size = LCD_H_RES, .v_size = LCD_V_RES,
                           .hsync_back_porch = 40, .hsync_pulse_width = 2, .hsync_front_porch = 40,
                           .vsync_back_porch = 8, .vsync_pulse_width = 2, .vsync_front_porch = 220 },
     };
     const esp_lcd_dpi_panel_config_t dpi_st7121 = {
         .virtual_channel = 0, .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
-        .dpi_clock_freq_mhz = 70, .in_color_format = LCD_COLOR_FMT_RGB565, .num_fbs = 1,
+        .dpi_clock_freq_mhz = 70, .in_color_format = LCD_COLOR_FMT_RGB565, .num_fbs = 2,
         .video_timing = { .h_size = LCD_H_RES, .v_size = LCD_V_RES,
                           .hsync_back_porch = 40, .hsync_pulse_width = 2, .hsync_front_porch = 40,
                           .vsync_back_porch = 24, .vsync_pulse_width = 20, .vsync_front_porch = 200 },
@@ -990,26 +1018,6 @@ esp_err_t lcd_ui_start(void)
     s_cfgq = xQueueCreate(4, sizeof(cfg_msg_t));
     if (!s_cfgq) return ESP_ERR_NO_MEM;
 
-    /* 预览双缓冲（PSRAM 777KB×2） */
-    for (int i = 0; i < 2; i++) {
-        s_pbuf[i] = heap_caps_malloc((size_t)PREV_W * PREV_H * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_pbuf[i]) memset(s_pbuf[i], 0, (size_t)PREV_W * PREV_H * 2);
-    }
-    if (s_pbuf[0] && s_pbuf[1]) {
-        for (int i = 0; i < 2; i++) {
-            s_dsc[i].header.cf = LV_COLOR_FORMAT_RGB565;
-            s_dsc[i].header.w = PREV_W;
-            s_dsc[i].header.h = PREV_H;
-            s_dsc[i].data_size = (uint32_t)PREV_W * PREV_H * 2;
-            s_dsc[i].data = (const uint8_t *)s_pbuf[i];
-        }
-        s_back = 1;
-    } else {
-        if (s_pbuf[0]) { heap_caps_free(s_pbuf[0]); s_pbuf[0] = NULL; }
-        if (s_pbuf[1]) { heap_caps_free(s_pbuf[1]); s_pbuf[1] = NULL; }
-        ESP_LOGW(TAG, "预览缓冲分配失败，降级为参数面板");
-    }
-
     ESP_LOGI(TAG, "display-init前内存: internal=%u dma=%u psram=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
@@ -1024,6 +1032,19 @@ esp_err_t lcd_ui_start(void)
     s_panel = panel;
     s_real_draw = panel->draw_bitmap;
     panel->draw_bitmap = draw_shim;
+
+    /* 驱动双帧缓冲（num_fbs=2，PSRAM 黑底）：预览写后备页 + 页指针翻页 */
+    void *fb0 = NULL, *fb1 = NULL;
+    if (esp_lcd_dpi_panel_get_frame_buffer(panel, 2, &fb0, &fb1) == ESP_OK) {
+        s_fb[0] = fb0;
+        s_fb[1] = fb1;
+        s_fb_px = (size_t)LCD_H_RES * LCD_V_RES;
+        s_cur = 0;
+        ESP_LOGI(TAG, "DSI 双帧缓冲就绪：fb0=%p fb1=%p（%u KB/页）",
+                 fb0, fb1, (unsigned)((size_t)LCD_H_RES * LCD_V_RES * 2 / 1024));
+    } else {
+        ESP_LOGW(TAG, "DSI 帧缓冲获取失败，仅参数面板（无预览）");
+    }
 
     lvgl_port_cfg_t lcfg = ESP_LVGL_PORT_INIT_CONFIG();
     lcfg.task_affinity = 0;   /* LVGL 渲染钉 core0（采集/编码/worker 在 core1） */
@@ -1065,7 +1086,7 @@ esp_err_t lcd_ui_start(void)
 
     if (xTaskCreatePinnedToCore(apply_task, "lcd_cfg", 8192, NULL, 5, NULL, 0) != pdPASS)
         return ESP_ERR_NO_MEM;
-    if (s_pbuf[0] && CONFIG_CAMTEST_LCD_PREVIEW_FPS > 0) {
+    if (s_fb[0] && CONFIG_CAMTEST_LCD_PREVIEW_FPS > 0) {
         /* ★ core0：core1 被 worker(prio13) 高占空碾压，prio2 的预览在 core1
          *   会饿死（实测 got=1-2 帧/s）；core0 只有 LVGL(prio4) 间歇忙，
          *   prio2 塞间隙足够（S31 版同思路：渲染/预览与采集编码分核） */
