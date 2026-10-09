@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """tab5_ws_probe.py — Tab5 WS v2 协议探针：收 H264/JPEG 帧、校验头、存 Annex-B 裸流。
-用法: tab5_ws_probe.py <host> [秒数=10] [outfile=/tmp/tab5.h264]"""
-import sys, time, socket, base64, os, struct
+用法: tab5_ws_probe.py <host> [秒数=10] [outfile=/tmp/tab5.h264] [port=81] [tls=0]
+  tls=1 连 :8443（wss，自签证书不校验）"""
+import sys, time, socket, base64, os, struct, ssl
 
 host = sys.argv[1] if len(sys.argv) > 1 else "192.168.3.44"
 secs = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
 outpath = sys.argv[3] if len(sys.argv) > 3 else "/tmp/tab5.h264"
+port = int(sys.argv[4]) if len(sys.argv) > 4 else 81
+use_tls = len(sys.argv) > 5 and sys.argv[5] in ("1", "tls", "wss")
 
 # ---- 极简 RFC6455 客户端（无掩码回显要求：客户端→服务器必须掩码）----
 key = base64.b64encode(os.urandom(16)).decode()
-s = socket.create_connection((host, 81), timeout=5)
-req = (f"GET /ws HTTP/1.1\r\nHost: {host}:81\r\nUpgrade: websocket\r\n"
+s = socket.create_connection((host, port), timeout=5)
+if use_tls:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    s = ctx.wrap_socket(s, server_hostname=host)
+req = (f"GET /ws HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
 s.sendall(req.encode())
 resp = b""

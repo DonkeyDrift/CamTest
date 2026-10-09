@@ -302,7 +302,9 @@ function vdecEnsure(w,h){
     V.dec=new VideoDecoder({
       output:vf=>{
         V.decFrames++;
-        const nowUs=performance.timeOrigin+performance.now()*1000;
+        /* ★ 括号必须包住再乘：timeOrigin 是【毫秒】，(origin+now)*1000 才是微秒；
+         * 写成 origin+now*1000 会得到混合单位（差 1000 倍），e2e 全体毒化成天文数字 */
+        const nowUs=Math.round((performance.timeOrigin+performance.now())*1000);
         if(V.lastStampUs) V.latSum+=nowUs-V.lastStampUs;
         const cv=$("video");
         if(cv.width!==vf.displayWidth||cv.height!==vf.displayHeight){cv.width=vf.displayWidth;cv.height=vf.displayHeight;}
@@ -329,10 +331,21 @@ function feedH264(meta, au, arriveUs){
     if(!meta.key) return;            /* 等 IDR 再起播（gop=30 → ≤1s） */
     V.needKey=false;
   }
-  V.lastStampUs=performance.timeOrigin+performance.now()*1000;
+  V.lastStampUs=Math.round((performance.timeOrigin+performance.now())*1000);
   try{
     V.dec.decode(new EncodedVideoChunk({type:meta.key?"key":"delta", timestamp:arriveUs/1000, data:au}));
   }catch(e){ V.decErrs++; vdecReset(); }
+}
+
+/* ============================== 流地址（secure context 自适应） ==============================
+ * 页面入口决定流端口/协议：
+ *   https 直连（:443） → wss://host:8443（TLS 流服务器）
+ *   http  直连（:80）  → ws://host:81（明文；无 WebCodecs → JPEG 预览流）
+ *   localhost 转发（tools/tab5_secure_proxy.py，:8080/:8081 成对）→ 流端口 = 页面端口+1
+ *   （http://localhost 本身就是 secure context——WebCodecs 可用且无需证书信任） */
+function streamPort(){
+  if(location.port) return String(Number(location.port)+1);
+  return location.protocol==="https:" ? "8443" : "81";
 }
 
 /* ============================== WebSocket 传输（协议 v2） ==============================
@@ -344,8 +357,13 @@ function wsLoop(){
   wsGen++; const g=wsGen;
   if(S.ws){ const o=S.ws; S.ws=null; o.onclose=null; o.onerror=null; try{o.close();}catch(e){} }
   if(S.transport!=="ws") return;
+  /* 连接换代：丢弃旧连接的帧样本（设备重启/断流期间新旧纪元混栈会让 e2e
+   * 出现天文数字级负值——帧的 t_cap 是旧纪元、offset 是新纪元） */
+  S.frames.length=0;
+  vdecReset();
   const host=location.hostname;
-  const ws=new WebSocket("ws://"+host+":81/ws");
+  const proto=location.protocol==="https:"?"wss":"ws";
+  const ws=new WebSocket(proto+"://"+host+":"+streamPort()+"/ws");
   S.ws=ws;
   ws.binaryType="arraybuffer";
   ws.onopen=()=>{ if(g!==wsGen) return; $("streamHint").style.display="none"; banner(null); };
@@ -369,6 +387,14 @@ function wsLoop(){
   };
   ws.onclose=()=>{
     if(g!==wsGen||S.transport!=="ws") return;
+    /* https 直连时 wss://…:8443 的证书例外与 :443 独立——引导用户先访问一次 */
+    if(location.protocol==="https:"&&!S.tlsHintShown){
+      S.tlsHintShown=true;
+      $("streamHint").innerHTML=`WSS 连不上？自签证书需分别信任：先打开 <a href="https://${location.hostname}:8443/" target="_blank" style="color:var(--acc)">https://${location.hostname}:8443/</a> 点「高级→继续前往」，再回本页刷新。3 s 后仍会自动重试…`;
+      $("streamHint").style.display="flex";
+      setTimeout(()=>{ if(g===wsGen&&S.transport==="ws") wsLoop(); },3000);
+      return;
+    }
     $("streamHint").textContent="WS 断开，1 s 后重连…";$("streamHint").style.display="flex";
     setTimeout(()=>{ if(g===wsGen&&S.transport==="ws") wsLoop(); },1000);
   };
@@ -383,7 +409,7 @@ async function streamLoop(){
   while(S.transport==="http"){
     streamAbort=new AbortController();
     try{
-      const r=await fetch(location.protocol+"//"+location.hostname+":81/stream",{signal:streamAbort.signal,cache:"no-store"});
+      const r=await fetch(location.protocol+"//"+location.hostname+":"+streamPort()+"/stream",{signal:streamAbort.signal,cache:"no-store"});
       if(!r.ok||!r.body) throw new Error("stream http "+r.status);
       $("streamHint").style.display="none";
       const rd=r.body.getReader();
@@ -449,6 +475,7 @@ function onFrame(meta, payload, arriveUs){
   if(meta.codec==="h264" && !HAS_WEBCODECS) return;         /* 解不了 H264：等预览帧 */
   if(meta.codec==="jpeg" && devH264 && HAS_WEBCODECS) return; /* Chrome：忽略冗余预览流 */
   const latTxUs=arriveUs - meta.cap + S.offsetUs;
+  if (latTxUs < -10e6 || latTxUs > 10e6) return;   /* 超界帧（±10s）：纪元错位/同步未收敛，弃样不毒化统计 */
   const encUs=meta.enc - meta.cap;
   S.frames.push({arrive:arriveUs, lat:latTxUs, latTx:latTxUs, enc:encUs, len:meta.len, fid:meta.fid,
                  w:meta.w, h:meta.h, q:meta.q, capDevUs:meta.cap, codec:meta.codec, key:meta.key,
@@ -559,7 +586,10 @@ function renderStatus(){
   $("codecNote").style.display = dev.usb_mode==="h264" ? "" : "none";
   $("codecNote").textContent = HAS_WEBCODECS ? "H.264 硬件解码" : "JPEG 预览流（无 WebCodecs）";
   $("codecNote").title = HAS_WEBCODECS ? "" :
-    "WebCodecs 仅在 Secure Context（https / localhost）暴露；http 直连时统一走设备并行发布的 JPEG 预览流，延迟与指标同源";
+    "WebCodecs 仅在 Secure Context（https / localhost）暴露。低延迟 H.264 路径：" +
+    "① https://" + (location.hostname||"tab5-cam.local") + "（自签证书，首次访问需在浏览器信任，流走 wss://…:8443）；" +
+    "② 运行 tools/tab5_secure_proxy.py 后访问 http://localhost:8080（localhost 即安全上下文，无需证书）。" +
+    "http 直连时自动走设备并行发布的 JPEG 预览流";
   $("bSource").innerHTML="源 <b>USB "+(dev.usb_device||"")+"</b>"+(dev.scaled?"·缩放":"");
   $("bSource").className="badge "+(usb.state==="streaming"?"ok":"warn");
   $("bSensor").innerHTML="sensor <b>"+(dev.sensor||"?")+"</b> · "+(dev.pix_fmt||"?");

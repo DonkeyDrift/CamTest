@@ -15,7 +15,9 @@ idf_component_register(
          "web_ui.c"
     INCLUDE_DIRS "."
     EMBED_FILES "fs_web/index.html"
-    REQUIRES esp_wifi nvs_flash esp_http_server cjson mdns esp_psram mbedtls
+                "certs/tab5_cert.pem"
+                "certs/tab5_key.pem"
+    REQUIRES esp_wifi nvs_flash esp_http_server esp_https_server cjson mdns esp_psram mbedtls
              usb usb_host_uvc esp_driver_jpeg esp_driver_i2c esp_driver_ppa esp_h264
              esp_video esp_cam_sensor
 )

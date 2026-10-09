@@ -96,8 +96,22 @@ C6 Wi-Fi（esp_hosted SDIO）←— esp_wifi_remote（IDF v6.1 内置）
 **连 Chrome/Edge 也没有 VideoDecoder**（实测 UA Chrome/146，`isSecureContext=false`）。
 因此固件在 h264 模式下**并行发布一条 JPEG 预览流**（与 H264 同源同刻、独立
 pv_* 计数不污染主指标）：无 WebCodecs 的页面自动渲染预览流，有 WebCodecs 的
-自动忽略它——所有 http 观看端都能出画面。要吃到真正的 H.264 硬解路径，需
-`https://` 访问（自签证书）或 localhost 端口转发。
+自动忽略它——所有 http 观看端都能出画面。
+
+吃到**真 H.264 硬解低延迟路径**的三种方式（均已真机验证）：
+
+| 方式 | 做法 | 证书摩擦 |
+|---|---|---|
+| ★ localhost 转发（推荐） | `python3 tools/tab5_secure_proxy.py [设备IP]` → 打开 `http://localhost:8080/` | 无（localhost 天然 secure context） |
+| https 直连 | 打开 `https://<设备IP>/`（或 `https://tab5-cam.local/`），流走 wss://…:8443 | 需分别对 :443 与 :8443 各点一次「高级→继续前往」（端口独立例外；WS 连不上时页面会给出引导链接） |
+| 信任证书 | 把 `main/certs/tab5_cert.pem` 导入系统信任 | 一次到位 |
+
+- 设备侧：`:443` https（esp_https_server，全功能 API/UI）、`:8443` wss/https
+  流（裸 mbedtls TLS，限 3 客户端，每连接 ~40KB 内部 RAM）；`:80/:81` 明文
+  全保留。证书为构建期生成的 10 年自签（SAN 含 tab5-cam.local/localhost/
+  127.0.0.1/192.168.3.44，换网段 IP 需重新生成或用 mDNS 域名访问）。
+- 实测（localhost 路径）：WebCodecs H264 硬解，320x240@44fps e2e≈43ms、
+  640x480 处理②≈26ms；wss 探针双流 44.5fps。
 
 ## 已知限制 / 后续工作
 

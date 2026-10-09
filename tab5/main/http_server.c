@@ -18,6 +18,7 @@
 #include <time.h>
 #include "esp_log.h"
 #include "esp_http_server.h"
+#include "esp_https_server.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
@@ -31,6 +32,15 @@
 
 static const char *TAG = "http_api";
 static httpd_handle_t s_server;
+static httpd_handle_t s_server_https;
+
+/* 自签证书（构建期生成，见 certs/；SAN 含 tab5-cam.local/localhost/127.0.0.1/192.168.3.44）。
+ * WebCodecs 是 Secure-Context-Only API——:443 https 入口让 Chrome/Edge 直连也能
+ * 硬解 H.264（http 入口保留，页面自动落到 JPEG 预览流） */
+extern const uint8_t tab5_cert_start[] asm("_binary_tab5_cert_pem_start");
+extern const uint8_t tab5_cert_end[]   asm("_binary_tab5_cert_pem_end");
+extern const uint8_t tab5_key_start[]  asm("_binary_tab5_key_pem_start");
+extern const uint8_t tab5_key_end[]    asm("_binary_tab5_key_pem_end");
 
 static char *status_buf(void)
 {
@@ -239,6 +249,7 @@ static const httpd_uri_t s_uris[] = {
 
 esp_err_t http_server_start(void)
 {
+    /* :80 明文（全功能；http 页面走 JPEG 预览流） */
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_open_sockets = 7;
     cfg.max_uri_handlers = 16;
@@ -250,5 +261,35 @@ esp_err_t http_server_start(void)
         httpd_register_uri_handler(s_server, &s_uris[i]);
     }
     ESP_LOGI(TAG, "http api server on :%u", cfg.server_port);
+
+    /* :443 https（同一组 handler；每 SSL 连接 ~40KB 内部 RAM → 限 4 socket）。
+     * ★ PEM 解析要求 NUL 终止——embed blob 不带终止符，必须拷贝补 NUL
+     *   （否则证书解析失败，握手期连接被 RST，真机踩过） */
+    static char https_cert_buf[4096], https_key_buf[4096];
+    size_t cert_len = tab5_cert_end - tab5_cert_start;
+    size_t key_len = tab5_key_end - tab5_key_start;
+    if (cert_len < sizeof(https_cert_buf) && key_len < sizeof(https_key_buf)) {
+        memcpy(https_cert_buf, tab5_cert_start, cert_len); https_cert_buf[cert_len] = 0;
+        memcpy(https_key_buf, tab5_key_start, key_len); https_key_buf[key_len] = 0;
+        httpd_ssl_config_t scfg = HTTPD_SSL_CONFIG_DEFAULT();
+        scfg.servercert = (const uint8_t *)https_cert_buf;
+        scfg.servercert_len = cert_len + 1;
+        scfg.prvtkey_pem = (const uint8_t *)https_key_buf;
+        scfg.prvtkey_len = key_len + 1;
+        scfg.httpd.max_uri_handlers = 16;
+        scfg.httpd.max_open_sockets = 4;
+        scfg.httpd.lru_purge_enable = true;
+        scfg.httpd.stack_size = 8192;
+        err = httpd_ssl_start(&s_server_https, &scfg);
+        if (err != ESP_OK) {
+            /* https 失败不致命：http 入口仍可用 */
+            ESP_LOGE(TAG, "https server 启动失败：%s（仅 http 可用）", esp_err_to_name(err));
+            return ESP_OK;
+        }
+        for (size_t i = 0; i < sizeof(s_uris) / sizeof(s_uris[0]); i++) {
+            httpd_register_uri_handler(s_server_https, &s_uris[i]);
+        }
+        ESP_LOGI(TAG, "https api server on :%u（自签证书，浏览器首次访问需信任）", scfg.port_secure);
+    }
     return ESP_OK;
 }
