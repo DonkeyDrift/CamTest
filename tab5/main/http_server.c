@@ -28,6 +28,7 @@
 #include "stream_server.h"
 #include "wifi_net.h"
 #include "web_ui.h"
+#include "lcd_ui.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "http_api";
@@ -140,7 +141,7 @@ static esp_err_t h_status(httpd_req_t *req)
         "\"uptime_s\":%u,"
         "\"overlay\":%s,\"target_mbps\":%.1f,\"gov_last\":\"%s\","
         "\"h264_kbps\":%u,"
-        "\"tcp_nodelay\":1,"
+        "\"tcp_nodelay\":1,\"lcd_on\":%s,"
         "\"wifi\":{\"mode\":\"%s\",\"phy\":\"%s\",\"channel\":%d,\"band_mhz\":%d,\"rssi\":%d,\"ssid\":\"%s\"},"
         "\"ip\":\"%s\",\"mdns\":\"%s.local\","
         "\"clients\":[%s],"
@@ -159,6 +160,7 @@ static esp_err_t h_status(httpd_req_t *req)
         m->stack_cap, m->stack_enc, (unsigned)m->uptime_s,
         src_if_overlay() ? "true" : "false", m->target_mbps, m->gov_last,
         (unsigned)src_if_h264_kbps(),
+        lcd_ui_active() ? "true" : "false",
         w->mode == WIFI_MODE_STA_M ? "STA" : "AP", w->phy, w->channel, w->band_mhz,
         w->rssi, w->ssid, w->ip, CONFIG_CAMTEST_MDNS_HOSTNAME, clients,
         esp_get_idf_version());

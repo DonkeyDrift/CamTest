@@ -22,6 +22,8 @@ esp_err_t board_power_init(void);            /* I2C + 两颗扩展器；幂等 *
 esp_err_t board_usb_vbus(bool on);           /* Type-A VBUS 供电（UVC 摄像头） */
 esp_err_t board_wifi_enable(bool on);        /* C6 协处理器电源 */
 esp_err_t board_camera_enable(bool on);      /* MIPI 相机电源（DVP 源用） */
+esp_err_t board_lcd_enable(bool on);         /* LCD 电源（exp0.4，开漏上拉特殊序列） */
+esp_err_t board_touch_enable(bool on);       /* 触摸电源（exp0.5） */
 struct i2c_master_bus_ctx;
 void *board_i2c_handle(void);                /* I2C0 总线句柄（相机 SCCB 用；i2c_master_bus_handle_t） */
 

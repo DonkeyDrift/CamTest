@@ -19,4 +19,11 @@ dependencies:
   # 以【本地组件】提供（tab5/components/，复制自 S31 工程已验证副本）——注册表
   # components-file 存储对 esp_video 全系列下载失败（S3 AccessDenied，2026-10-09 实测）。
   # 其余依赖（esp_ipa 2.1.* 等）仍由组件管理器从注册表解析
+  # ---- LCD/触屏（Tab5 三代屏：探测运行时分版本，见 lcd_ui.c）----
+  espressif/esp_lcd_st7123: "*"
+  espressif/esp_lcd_ili9881c: "*"
+  espressif/esp_lcd_touch_st7123: "*"
+  espressif/esp_lcd_touch_gt911: "*"
+  espressif/esp_lvgl_port: "^2"
+  lvgl/lvgl: "^9.2"
   idf: ">=6.1"

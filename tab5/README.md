@@ -113,6 +113,46 @@ pv_* 计数不污染主指标）：无 WebCodecs 的页面自动渲染预览流�
 - 实测（localhost 路径）：WebCodecs H264 硬解，320x240@44fps e2e≈43ms、
   640x480 处理②≈26ms；wss 探针双流 44.5fps。
 
+## LCD 触屏控制台（移植自 S31 lcd_ui c0c104c）
+
+Tab5 板载 5" **MIPI-DSI 竖屏 720x1280**，三代面板运行时探测（触摸 IC I2C：
+0x55 ST712x 读固件号分 ST7121/ST7123，0x5D/0x14 为 GT911+ILI9881C）。
+本机为**板版2：ST7123**（fw=3）。UI：顶部 720x540 实时预览 + 状态两列 +
+触屏控制（Source/三模式/Res/H264 kbps/Quality/Fps/Overlay/Mbps），动作走
+`app_config_apply`（与网页 POST /api/config 完全同路径，NVS 持久化），
+`/api/status` 新增 `lcd_on` 字段。
+
+移植中的三个真机坑（都已修，详见 lcd_ui.c 注释）：
+1. **触摸探测需先放 LCD 电源**（同电源域）：只开 TOUCH_EN 时 0x55/0x14
+   均无应答；先 `board_lcd_enable`（exp0.4 开漏上拉放电源）再探测即中。
+2. **esp_lvgl_port 渲染持锁 vs 预览**：竖屏 720x1280 全幅渲染+DSI vsync
+   flush 期间持锁，预览经 LVGL `set_src` 抢锁被压到 1-2 fps——改为
+   **直写 DSI 帧缓冲**（`draw_bitmap`，LVGL 不感知预览区）。
+3. **PSRAM 带宽是预览瓶颈**：720x540 全幅软件缩放+双缓冲每帧 ~3MB 流量
+   （~400ms/帧）——MJPEG 全档为 MCU(16) 倍数、解码行距==宽，改为
+   **解码输出 letterbox 直贴**（零缩放零中转），320x240 档预览满速跟流。
+
+### ★ 资源取舍：DVP 与 LCD+H264 互斥（2026-10-09 实证）
+
+`esp_video/ISP/CSI` 链的常驻内部 RAM/中断占用与 `esp_h264` 参考帧
+（硬性 `ESP_H264_MEM_INTERNAL`，640x480 约需百 KB 级内部大块）+ LCD
+（DSI/LVGL）**三者不可兼得**：DVP=y 且 LCD=y 时 H264 开流报
+`No memory for reference frame`、CSI 报 `dw_gdma alloc interrupt failed`。
+默认 `CONFIG_CAMTEST_ENABLE_DVP=n`（主诉求组合 = UVC H.264 + LCD）；
+需要板载相机时关 LCD 再开 DVP。Kconfig help 有完整说明。
+
+### LCD 开销实测（A/B，h264 640x480 同 build 序列）
+
+| 指标 | LCD off | LCD on（预览 10fps 档） |
+|---|---|---|
+| cap/enc fps | 15.0 | 14.9（−0.7%） |
+| 预览解码占用 | — | dec 5-7ms × 4-6fps ≈ 3%（共享解码器） |
+| CPU0/CPU1 | — | 51/61（core1 主流水不受预览挤占） |
+
+预览实际帧率：320x240 档满速跟流（~27fps），640x480 档 4-6fps（PSRAM
+带宽+限速 10fps 以下）；触屏操作与显示效果需现场目验（远程仅能验证
+I2C/日志/链路）。
+
 ## 已知限制 / 后续工作
 
 - **720p H264 只有 8fps**：解码+重排+编码在 720p 下超帧预算（估计重排 ~32ms+

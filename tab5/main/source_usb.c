@@ -36,6 +36,7 @@
 #include "driver/jpeg_encode.h"
 #include "driver/ppa.h"
 #include "h264_pipeline.h"
+#include "jpeg_dec_share.h"
 #include "yuv_osd.h"
 #include "sdkconfig.h"
 
@@ -93,8 +94,8 @@ struct usb_priv_s {
     volatile bool stream_up;
     volatile uint32_t stream_gen;
 
-    /* MJPEG 硬解码（h264/reencode 共用）：JPEG→UYVY 直写解码缓冲 */
-    jpeg_decoder_handle_t dec;
+    /* MJPEG 硬解码（h264/reencode 共用）：引擎走 jpeg_dec_share（全局单例，
+     * 与 lcd_ui 预览互斥共享），此处只管输出缓冲 */
     uint8_t *dec_out;                           /* 解码输出（native 16对齐尺寸 UYVY） */
     size_t dec_out_len;
     bool dec_src_mjpeg;                         /* 当前流是否 MJPEG 档 */
@@ -488,15 +489,12 @@ static void encoder_close(void)
         s_u.jenc_out.start = NULL;
         s_u.jenc_out.length = 0;
     }
-    if (s_u.dec) {
-        jpeg_del_decoder_engine(s_u.dec);
-        s_u.dec = NULL;
-    }
     if (s_u.dec_out) {
         heap_caps_free(s_u.dec_out);
         s_u.dec_out = NULL;
         s_u.dec_out_len = 0;
     }
+    /* 解码引擎已改全局共享（jpeg_dec_share）：此处不再销毁（lcd_ui 预览共用） */
 }
 
 static esp_err_t encoder_open(int out_w, int out_h, int fps)
@@ -504,15 +502,9 @@ static esp_err_t encoder_open(int out_w, int out_h, int fps)
     ESP_LOGI(TAG, "encoder_open: %dx%d mode=%s%s", out_w, out_h,
              s_u.mode == USB_MODE_H264 ? "h264" : "reencode",
              s_u.dec_src_mjpeg ? "（MJPEG 输入＋硬解码）" : "");
-    if (s_u.dec || s_u.h264 || s_u.jenc) encoder_close();   /* 重入防护 */
+    if (s_u.h264 || s_u.jenc) encoder_close();   /* 重入防护 */
     const bool need_dec = s_u.dec_src_mjpeg;
     if (need_dec) {
-        jpeg_decode_engine_cfg_t ecfg = { .intr_priority = 0, .timeout_ms = DEC_TIMEOUT_MS };
-        esp_err_t derr = jpeg_new_decoder_engine(&ecfg, &s_u.dec);
-        if (derr != ESP_OK) {
-            ESP_LOGE(TAG, "jpeg 解码引擎创建失败 %s", esp_err_to_name(derr));
-            return ESP_FAIL;
-        }
         int nw = (s_u.w + 15) & ~15, nh = (s_u.h + 15) & ~15;
         jpeg_decode_memory_alloc_cfg_t mcfg = { .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER };
         /* 两种模式都解码 YUV422（rev<3.0 禁止 422→420 转换）：h264 软件重排为
@@ -881,7 +873,7 @@ static void worker_task(void *arg)
             const uint8_t *src = f->data;
             uint64_t t_pre = esp_timer_get_time();
             if (s_u.dec_src_mjpeg) {
-                if (!s_u.dec || !s_u.dec_out) {
+                if (!s_u.dec_out) {
                     s_u.stats.cap_drops++;
                     ret_frame(h, f);
                     s_u.worker_busy = false;
@@ -889,8 +881,8 @@ static void worker_task(void *arg)
                 }
                 jpeg_decode_cfg_t dc = { .output_format = JPEG_DECODE_OUT_FORMAT_YUV422 };
                 uint32_t dec_len = 0;
-                esp_err_t derr = jpeg_decoder_process(s_u.dec, &dc, f->data, f->data_len,
-                                                      s_u.dec_out, s_u.dec_out_len, &dec_len);
+                esp_err_t derr = jpeg_dec_share_process(&dc, f->data, f->data_len,
+                                                        s_u.dec_out, s_u.dec_out_len, &dec_len);
                 if (derr != ESP_OK) {
                     static uint32_t dec_err;
                     if (++dec_err % 30 == 1)

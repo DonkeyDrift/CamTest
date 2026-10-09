@@ -14,6 +14,8 @@ static const char *TAG = "board_pwr";
 #define BSP_WIFI_EN        (IO_EXPANDER_PIN_NUM_0)   /* 扩展器1 */
 #define BSP_USB_EN         (IO_EXPANDER_PIN_NUM_3)   /* 扩展器1 */
 #define BSP_CAMERA_EN      (IO_EXPANDER_PIN_NUM_6)   /* 扩展器0 */
+#define BSP_LCD_EN         (IO_EXPANDER_PIN_NUM_4)   /* 扩展器0：使能=开漏+上拉（高阻放电源） */
+#define BSP_TOUCH_EN       (IO_EXPANDER_PIN_NUM_5)   /* 扩展器0 */
 
 static i2c_master_bus_handle_t s_i2c;
 static esp_io_expander_handle_t s_exp0, s_exp1;   /* 0=LOW 地址，1=HIGH 地址 */
@@ -73,4 +75,32 @@ void *board_i2c_handle(void)
 {
     board_power_init();
     return (void *)s_i2c;
+}
+
+esp_err_t board_lcd_enable(bool on)
+{
+    ESP_RETURN_ON_ERROR(board_power_init(), TAG, "pwr init");
+    /* 与 BSP bsp_feature_enable(BSP_FEATURE_LCD) 同序列：
+     * on = 输入+上拉+开漏（引脚放电源，面板供电）；
+     * off = 推挽输出低（ actively 拉断电） */
+    esp_err_t err;
+    if (on) {
+        err = esp_io_expander_set_pullupdown(s_exp0, BSP_LCD_EN, IO_EXPANDER_PULL_UP);
+        if (err == ESP_OK) err = esp_io_expander_set_dir(s_exp0, BSP_LCD_EN, IO_EXPANDER_INPUT);
+        if (err == ESP_OK) err = esp_io_expander_set_output_mode(s_exp0, BSP_LCD_EN, IO_EXPANDER_OUTPUT_MODE_OPEN_DRAIN);
+    } else {
+        err = esp_io_expander_set_dir(s_exp0, BSP_LCD_EN, IO_EXPANDER_OUTPUT);
+        if (err == ESP_OK) err = esp_io_expander_set_level(s_exp0, BSP_LCD_EN, 0);
+        if (err == ESP_OK) err = esp_io_expander_set_output_mode(s_exp0, BSP_LCD_EN, IO_EXPANDER_OUTPUT_MODE_PUSH_PULL);
+    }
+    ESP_LOGI(TAG, "LCD 电源 %s", on ? "ON（开漏上拉放电源）" : "OFF");
+    return err;
+}
+
+esp_err_t board_touch_enable(bool on)
+{
+    ESP_RETURN_ON_ERROR(board_power_init(), TAG, "pwr init");
+    esp_err_t err = pin_out(s_exp0, BSP_TOUCH_EN, on);
+    ESP_LOGI(TAG, "触摸电源 %s", on ? "ON" : "OFF");
+    return err;
 }

@@ -33,7 +33,7 @@ typedef struct {
     bool (*res_supported)(int w, int h);
 } src_backend_t;
 
-#if CONFIG_CAMTEST_ENABLE_DVP
+#ifdef CONFIG_CAMTEST_ENABLE_DVP
 /* source_dvp.c */
 esp_err_t source_dvp_init(void);
 esp_err_t source_dvp_start(void);
@@ -78,7 +78,7 @@ uint32_t source_usb_h264_kbps(void);
 #endif
 
 static const src_backend_t s_backends[] = {
-#if CONFIG_CAMTEST_ENABLE_DVP
+#ifdef CONFIG_CAMTEST_ENABLE_DVP
     [VIDEO_SOURCE_DVP] = {
         .init = source_dvp_init,
         .start = source_dvp_start,
@@ -163,7 +163,7 @@ esp_err_t src_if_init(void)
     ESP_RETURN_ON_FALSE(s_if.ring, ESP_ERR_NO_MEM, TAG, "frame ring");
 
     s_if.current = VIDEO_SOURCE_USB;
-#if CONFIG_CAMTEST_ENABLE_DVP
+#ifdef CONFIG_CAMTEST_ENABLE_DVP
     /* DVP 允许失败（无相机/ISP 初始化失败时仍可运行 USB 源） */
     if (be(VIDEO_SOURCE_DVP)->init() != ESP_OK) {
         ESP_LOGW(TAG, "DVP 后端初始化失败（MIPI 相机不可用，USB 源不受影响）");
@@ -174,8 +174,11 @@ esp_err_t src_if_init(void)
     ESP_RETURN_ON_ERROR(u->init(), TAG, "usb init");
 #endif
     s_if.inited = true;
-    ESP_LOGI(TAG, "采集源就绪：USB-UVC（默认）%s",
-             CONFIG_CAMTEST_ENABLE_DVP ? "+ DVP（SC202CS）" : "");
+#ifdef CONFIG_CAMTEST_ENABLE_DVP
+    ESP_LOGI(TAG, "采集源就绪：USB-UVC（默认）+ DVP（SC202CS）");
+#else
+    ESP_LOGI(TAG, "采集源就绪：USB-UVC（默认；DVP 编译未启用）");
+#endif
     return ESP_OK;
 }
 

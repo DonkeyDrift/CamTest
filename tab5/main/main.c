@@ -28,6 +28,7 @@
 #include "metrics.h"
 #include "app_config.h"
 #include "board_power.h"
+#include "lcd_ui.h"
 #include "cJSON.h"
 #include "sdkconfig.h"
 
@@ -129,6 +130,11 @@ void app_main(void)
 
     metrics_start();
     xTaskCreatePinnedToCore(cam_watch_task, "cam_watch", 3072, NULL, 3, NULL, 0);
+
+    /* LCD 触屏控制台（探测失败自动跳过，不影响主流程） */
+    esp_err_t lerr = lcd_ui_start();
+    if (lerr != ESP_OK)
+        ESP_LOGW(TAG, "LCD UI 未启用（%s）", esp_err_to_name(lerr));
 
     ESP_LOGI(TAG, "ready: http://%s.local  (IP %s)", CONFIG_CAMTEST_MDNS_HOSTNAME, wifi_net_info()->ip);
 }

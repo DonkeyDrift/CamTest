@@ -55,7 +55,14 @@ menu "CamTest Tab5 Configuration"
 
     config CAMTEST_ENABLE_DVP
         bool "启用板载 MIPI 相机采集通路（SC202CS，esp_video CSI+ISP）"
-        default y
+        default n
+        help
+            ★ 资源取舍（2026-10-09 真机实测）：esp_video/ISP/CSI 链的常驻
+            内部 RAM/中断占用与 LCD（DSI）+ H.264（参考帧要大块内部 RAM）
+            三者不能同时满足——DVP=y 且 LCD=y 时 esp_h264 参考帧分配失败
+            （No memory for reference frame）且 CSI 的 dw-gdma 中断分配失败。
+            主诉求组合（UVC H.264 + LCD 触控）下保持 n；需要板载相机时
+            关掉 ENABLE_LCD 再开此选项。
 
     choice CAMTEST_USB_DEFAULT_MODE
         prompt "USB 摄像头默认工作模式"
@@ -81,5 +88,21 @@ menu "CamTest Tab5 Configuration"
         int "H.264 GOP（IDR 间隔帧数；浏览器中途加入需等到 IDR）"
         default 30
         range 1 255
+
+    config CAMTEST_ENABLE_LCD
+        bool "启用 LCD 触屏控制台（MIPI-DSI 三代屏自动探测 + LVGL）"
+        default y
+        help
+            移植自 S31 lcd_ui：实时预览（JPEG 预览流硬解）+ 运行参数面板 +
+            触屏调参（与网页 /api/config 同路径，NVS 持久化）。
+            未探测到屏时自动跳过（主流程不受影响）。
+
+    config CAMTEST_LCD_PREVIEW_FPS
+        int "LCD 预览解码限速（fps；0=只参数面板不解码）"
+        default 10
+        range 0 30
+        help
+            预览任务经 jpeg_dec_share 与主流水互斥共享 P4 解码器单例，
+            限速压碰撞概率（S31 实测 10fps 档对主流影响最小）。
 
 endmenu
