@@ -2,14 +2,19 @@
 #include "metrics.h"
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdarg.h>
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "esp_log.h"
 #include "freertos/task.h"
 #include "source_if.h"
 #include "frame_ring.h"
 #include "stream_server.h"
 #include "wifi_net.h"
+
+static const char *TAG = "metrics";
 
 static metrics_t s_m;
 static TaskHandle_t s_cap_h, s_enc_h;
@@ -31,29 +36,56 @@ void metrics_set_target_mbps(float v)
 /*
  * CPU 占用率：vTaskGetRunTimeStats 输出格式为 "<name> <abs_ticks> <pct>%\r\n"，
  * 取 IDLE0/IDLE1 行的最后一个百分数字段 → CPU0 = 100 − idle0%。
+ * ★ 缓冲必须装下全表：Tab5 任务数 ~40（esp_hosted/lwip/USB/LVGL…），
+ *   1024B 会把按占用排序后靠后的 IDLE 行截掉 → 占用率虚高（实机踩过：
+ *   15fps reencode 显示 68/76% 纹丝不动，4KB 后回落到真实值）。
+ *   同时每分钟输出一次 top-5 任务占用，便于定位真实负载源。
  */
 static void update_cpu(void)
 {
 #if CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
-    static char buf[1024];
+    static char buf[4096];
     vTaskGetRunTimeStats(buf);
     float idle[2] = { 0, 0 };
+    char tn[5][16] = {{0}};
+    float tp[5] = {0};
     char *line = buf;
     while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;   /* 原地截断行：strlen/解析只在行内 */
         char name[20] = {0};
-        char pcts[24] = {0};
-        /* 行内按空白切：第 1 段任务名，最后一段是 "12.3%" 形式 */
-        if (sscanf(line, "%19s %*s %24s", name, pcts) >= 2) {
-            char *pct_end;
-            float v = strtof(pcts, &pct_end);   /* 自动停在 '%' */
+        if (sscanf(line, "%19s", name) == 1) {
+            /* 百分比 = 行尾 token（vTaskGetRunTimeStats 行格式
+             * "name<pad> <ticks>  <pct>%"；任务名可含空格如 "Tmr Svc"，
+             * 按空格切段会把 ticks 当百分比——必须取行尾） */
+            const char *p = line + strlen(line);
+            while (p > line && isspace((unsigned char)p[-1])) p--;
+            while (p > line && !isspace((unsigned char)p[-1])) p--;
+            float v = strtof(p, NULL);   /* 自动停在 '%'；"<1%" → 0 */
             if (strncmp(name, "IDLE0", 5) == 0) idle[0] = v;
             if (strncmp(name, "IDLE1", 5) == 0) idle[1] = v;
+            if (v > tp[4]) {   /* top-5 插入（升序尾部替换后冒泡归位） */
+                tp[4] = v;
+                strlcpy(tn[4], name, sizeof(tn[4]));
+                for (int i = 4; i > 0 && tp[i] > tp[i - 1]; i--) {
+                    float tf = tp[i]; tp[i] = tp[i - 1]; tp[i - 1] = tf;
+                    char tmpn[16];
+                    strlcpy(tmpn, tn[i], sizeof(tmpn));
+                    strlcpy(tn[i], tn[i - 1], sizeof(tn[i]));
+                    strlcpy(tn[i - 1], tmpn, sizeof(tn[i - 1]));
+                }
+            }
         }
-        char *nl = strchr(line, '\n');
         line = nl ? nl + 1 : NULL;
     }
     s_m.cpu0 = 100.0f - idle[0];
     s_m.cpu1 = 100.0f - idle[1];
+    static int topn;
+    if (++topn >= 6) {
+        topn = 0;
+        ESP_LOGI(TAG, "CPU top5: %s %.1f%% | %s %.1f%% | %s %.1f%% | %s %.1f%% | %s %.1f%%",
+                 tn[0], tp[0], tn[1], tp[1], tn[2], tp[2], tn[3], tp[3], tn[4], tp[4]);
+    }
 #endif
 }
 
