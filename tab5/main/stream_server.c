@@ -181,12 +181,22 @@ static int cli_recv(client_t *c, void *buf, size_t len)
 }
 
 /* ---------------- 客户端管理 ---------------- */
+/* 客户端是 JPEG 预览流（pv）的潜在消费者——有连接就要求 worker 生产 pv */
+static void pv_ws_update_locked(void)
+{
+    bool any = false;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (s_cli[i].in_use) { any = true; break; }
+    src_if_pv_ws(any);
+}
+
 static client_t *client_alloc(void)
 {
     xSemaphoreTake(s_cli_lock, portMAX_DELAY);
     client_t *c = NULL;
     for (int i = 0; i < MAX_CLIENTS; i++)
         if (!s_cli[i].in_use) { c = &s_cli[i]; memset(c, 0, sizeof(*c)); c->in_use = true; break; }
+    pv_ws_update_locked();
     xSemaphoreGive(s_cli_lock);
     return c;
 }
@@ -194,6 +204,7 @@ static void client_free(client_t *c)
 {
     xSemaphoreTake(s_cli_lock, portMAX_DELAY);
     c->in_use = false;
+    pv_ws_update_locked();
     xSemaphoreGive(s_cli_lock);
 }
 static void client_tick(client_t *c)

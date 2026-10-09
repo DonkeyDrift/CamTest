@@ -96,7 +96,8 @@ typedef enum {
 
 /* ---------------- 全局状态 ---------------- */
 static volatile bool s_active;
-static volatile bool s_preview_on;
+static volatile bool s_preview_on;      /* 预览任务存在（fb/分配成功） */
+static volatile bool s_pv_on = true;    /* 用户预览开关（屏上按钮） */
 static board_version_t s_board_ver = BOARD_V_UNKNOWN;
 
 /* DSI 双帧缓冲（驱动分配，PSRAM 黑底）：预览写后备页，draw_bitmap(fb 指针)
@@ -115,15 +116,16 @@ static portMUX_TYPE s_st_mux = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct { char json[176]; } cfg_msg_t;
 static QueueHandle_t s_cfgq;
+static SemaphoreHandle_t s_pv_notify;   /* 帧环发布 + 按钮唤醒共用 */
 
 static lv_obj_t *s_img, *s_nosig;
 static lv_obj_t *l_fps, *l_rate, *l_cpu, *l_heap, *l_psram;
 static lv_obj_t *l_src, *l_wifi, *l_ip, *l_lcd, *l_e2e;
-static lv_obj_t *b_dvp, *b_usb, *b_pt, *b_h264, *b_re, *b_ov, *b_ov_lab;
+static lv_obj_t *b_dvp, *b_usb, *b_pt, *b_h264, *b_re, *b_ov, *b_ov_lab, *b_pv, *b_pv_lab;
 static lv_obj_t *v_res, *v_kb, *v_q, *v_fps, *v_mb;
 static lv_obj_t *l_status;
 static bool s_nosig_shown = true;
-static int s_prev_src = -1, s_prev_um = -1, s_prev_ov = -1, s_st_col = -1;
+static int s_prev_src = -1, s_prev_um = -1, s_prev_ov = -1, s_prev_pv = -1, s_st_col = -1;
 
 /* 预览解码输出缓冲（MCU 32 对齐） */
 static uint8_t *s_out;
@@ -225,6 +227,7 @@ typedef enum {
     ACT_FPS_DEC, ACT_FPS_INC,
     ACT_OV_TOGGLE,
     ACT_MB_DEC, ACT_MB_INC,
+    ACT_PV_TOGGLE,
 } act_t;
 
 static void send_json(const char *json)
@@ -356,6 +359,16 @@ static void act_event(lv_event_t *e)
         else        snprintf(json, sizeof(json), "{\"target_mbps\":%d.0}", n);
         break;
     }
+    case ACT_PV_TOGGLE:
+        /* LCD 本地开关（不动流水线）：关=预览任务注销帧环深度休眠 +
+         * 通知 worker 停产 pv（无流客户端时），算力让给主链 */
+        if (!s_preview_on) { status_set("preview task n/a"); return; }
+        s_pv_on = !s_pv_on;
+        src_if_pv_lcd(s_pv_on);
+        if (s_pv_on && s_pv_notify) xSemaphoreGive(s_pv_notify);
+        setl(s_nosig, s_pv_on ? "NO SIGNAL" : "preview off");
+        status_set(s_pv_on ? "preview on" : "preview off: CPU -> main");
+        return;
     default:
         return;
     }
@@ -472,7 +485,7 @@ static void preview_task(void *arg)
         .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
     };
 
-    SemaphoreHandle_t notify = xSemaphoreCreateBinary();
+    SemaphoreHandle_t notify = s_pv_notify;
     frame_ring_t *reg = NULL;
     uint32_t last_fid = 0;
     float ema_ms = 0;
@@ -480,6 +493,14 @@ static void preview_task(void *arg)
     int win_cnt = 0;
 
     for (;;) {
+        if (!s_pv_on) {
+            /* 预览关（屏上按钮）：注销帧环订阅、深睡等唤醒——解码/放大/
+             * 翻页全部停止，PSRAM 带宽与 core0 时间让给主链 */
+            if (reg) { frame_ring_unregister(reg, notify); reg = NULL; }
+            s_prev_fps = 0;
+            xSemaphoreTake(notify, portMAX_DELAY);
+            continue;
+        }
         frame_ring_t *cur = src_if_ring();
         if (cur && cur != reg) {
             if (reg) frame_ring_unregister(reg, notify);
@@ -679,10 +700,17 @@ static void panel_timer(lv_timer_t *t)
     }
     int st_ov = src_if_overlay() ? 1 : 0;
     if (st_ov != s_prev_ov) { hl(b_ov, st_ov != 0); s_prev_ov = st_ov; }
+    int st_pv = s_pv_on ? 1 : 0;
+    if (st_pv != s_prev_pv) {
+        hl(b_pv, st_pv != 0);
+        setl(b_pv_lab, st_pv ? "ON" : "OFF");
+        s_prev_pv = st_pv;
+    }
 
     if (s_fb[0]) {
         uint32_t now32 = (uint32_t)esp_timer_get_time();
-        bool show = (s_last_frame_us == 0) || (uint32_t)(now32 - s_last_frame_us) > 3000000u;
+        bool show = !s_pv_on || (s_last_frame_us == 0) ||
+                    (uint32_t)(now32 - s_last_frame_us) > 3000000u;
         if (show != s_nosig_shown) {
             lv_obj_set_hidden(s_nosig, !show);
             s_nosig_shown = show;
@@ -780,8 +808,11 @@ static void build_ui(void)
     y += CTL_STEP;
     mk_cap(scr, 8, y + 6, "Fps max");
     mk_btn(scr, 240, y, 70, 42, "<", ACT_FPS_DEC);
-    v_fps = mk_val(scr, 318, y + 10, 200);
-    mk_btn(scr, 530, y, 70, 42, ">", ACT_FPS_INC);
+    v_fps = mk_val(scr, 318, y + 10, 160);
+    mk_btn(scr, 490, y, 70, 42, ">", ACT_FPS_INC);
+    mk_cap(scr, 578, y + 6, "PV");
+    b_pv = mk_btn(scr, 612, y, 100, 42, "ON", ACT_PV_TOGGLE);
+    b_pv_lab = lv_obj_get_child(b_pv, 0);
 
     y += CTL_STEP;
     mk_cap(scr, 8, y + 6, "Overlay");
@@ -1086,7 +1117,8 @@ esp_err_t lcd_ui_start(void)
 
     if (xTaskCreatePinnedToCore(apply_task, "lcd_cfg", 8192, NULL, 5, NULL, 0) != pdPASS)
         return ESP_ERR_NO_MEM;
-    if (s_fb[0] && CONFIG_CAMTEST_LCD_PREVIEW_FPS > 0) {
+    s_pv_notify = xSemaphoreCreateBinary();
+    if (s_fb[0] && s_pv_notify && CONFIG_CAMTEST_LCD_PREVIEW_FPS > 0) {
         /* ★ core0：core1 被 worker(prio13) 高占空碾压，prio2 的预览在 core1
          *   会饿死（实测 got=1-2 帧/s）；core0 只有 LVGL(prio4) 间歇忙，
          *   prio2 塞间隙足够（S31 版同思路：渲染/预览与采集编码分核） */

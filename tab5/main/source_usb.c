@@ -995,11 +995,13 @@ static void worker_task(void *arg)
                  * 统计走 pv_* 独立计数，不污染主指标（out_frames=H264 出帧）。
                  * ★ 自适应让路：相机输出帧率随枚举波动（全速下实测 15~24fps），
                  *   上一帧总处理超 40ms（>24fps 周期的安全余量）时跳过本帧预览，
-                 *   保 H264 主链不堆积；空闲时预览全速 */
+                 *   保 H264 主链不堆积；空闲时预览全速。
+                 * ★ 按需生产：LCD 屏预览关 && 无流客户端时整段跳过
+                 *   （src_if_pv_wanted，省 fill+JPEG 编码 ~6-8ms/帧） */
                 static uint64_t last_total_us;
                 uint64_t total_us = t_enc_done - t_arr;
                 if (s_u.jenc && s_u.jenc_in.start && s_u.jenc_out.start &&
-                    last_total_us < 40000) {
+                    last_total_us < 40000 && src_if_pv_wanted()) {
                     fill_encoder_input(s_u.jenc_in.start, s_u.dec_out, s_u.w, s_u.h,
                                        s_u.out_w, s_u.out_h, kx, ky, x0, y0,
                                        false, t_arr);   /* false=不交换字节序；OSD 已在 dec_out（重绘同值无害） */

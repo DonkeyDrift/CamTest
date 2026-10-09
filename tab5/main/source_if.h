@@ -120,6 +120,12 @@ void          src_if_usb_set_inherent_ms(float ms);
 esp_err_t     src_if_h264_set_bitrate_kbps(uint32_t kbps);  /* H.264 码率在线调整 */
 uint32_t      src_if_h264_kbps(void);                       /* 当前 H.264 目标码率 */
 
+/* JPEG 预览流（h264 模式的 pv 附产）按需门控：没人消费就不花
+ * fill+JPEG 编码的算力。LCD 预览按钮与 stream_server 客户端增删各自置位 */
+void          src_if_pv_lcd(bool on);   /* LCD 屏上预览开关（lcd_ui） */
+void          src_if_pv_ws(bool on);    /* 有流客户端连接（stream_server） */
+bool          src_if_pv_wanted(void);   /* worker 每帧查询：是否需要生产 pv */
+
 const char *src_if_source_name(video_source_t s);
 const char *src_if_usb_mode_name(usb_mode_t m);
 const char *src_if_ts_meaning_name(ts_meaning_t m);

@@ -299,3 +299,11 @@ void src_if_usb_set_inherent_ms(float ms) { }
 esp_err_t src_if_h264_set_bitrate_kbps(uint32_t kbps) { return ESP_ERR_NOT_SUPPORTED; }
 uint32_t src_if_h264_kbps(void) { return 0; }
 #endif
+
+/* ---------- JPEG 预览流按需门控（与 USB 编译开关无关，跨源通用） ---------- */
+static volatile bool s_pv_lcd = true;   /* LCD 屏上预览（默认开） */
+static volatile bool s_pv_ws;           /* 有流客户端（stream_server 增删挂钩） */
+
+void src_if_pv_lcd(bool on) { s_pv_lcd = on; }
+void src_if_pv_ws(bool on) { s_pv_ws = on; }
+bool src_if_pv_wanted(void) { return s_pv_lcd || s_pv_ws; }
